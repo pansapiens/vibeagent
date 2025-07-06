@@ -1,0 +1,46 @@
+{
+  "allowedPaths": [
+    "$HOME/ai_workspace"
+  ],
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-filesystem",
+        "$HOME/ai_workspace"
+      ]
+    },
+    "fetch": {
+      "command": "uvx",
+      "args": [
+        "mcp-server-fetch"
+      ]
+    },
+    "playwright": {
+      "command": "npx",
+      "args": [
+        "@executeautomation/playwright-mcp-server"
+      ],
+      "disabled": false,
+      "autoApprove": []
+    },
+    "wcgw": {
+      "command": "uv",
+      "args": [
+        "tool",
+        "run",
+        "--python",
+        "3.12",
+        "wcgw@latest"
+      ]
+    },
+    "pubmed": {
+      "command": "uvx",
+      "args": [
+        "--quiet",
+        "pubmedmcp@latest"
+      ]
+    }
+  }
+}
