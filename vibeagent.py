@@ -142,9 +142,8 @@ class ChatApp(App):
         )
         self.setup_agent_and_tools()
 
-        # Add model info to the footer
-        footer = self.query_one(Footer)
-        footer.mount(Static(f"Model: {self.model_id}"))  # Add this line
+        # Log the model name during initialization
+        logging.info(f"Model initialized: {self.model_id}")
 
         self.query_one("#chat-history").mount(
             Static(
