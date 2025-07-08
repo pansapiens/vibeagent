@@ -147,7 +147,7 @@ class ChatApp(App):
 
         self.query_one("#chat-history").mount(
             Static(
-                "Agent is ready. Type your message and press Enter.",
+                f"Agent is ready. Model: {self.model_id}. Type your message and press Enter.",
                 classes="info-message",
             )
         )
