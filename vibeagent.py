@@ -127,6 +127,7 @@ class ChatApp(App):
         self.history_index = -1
         self.settings = {}
         self.mcp_log_files = {}  # Store MCP server log files
+        self.model_id = None  # Add this line
 
     def on_mount(self) -> None:
         """Called when the app is mounted. Sets up the agent and MCP connections."""
@@ -140,6 +141,11 @@ class ChatApp(App):
             )
         )
         self.setup_agent_and_tools()
+
+        # Add model info to the footer
+        footer = self.query_one(Footer)
+        footer.mount(Static(f"Model: {self.model_id}"))  # Add this line
+
         self.query_one("#chat-history").mount(
             Static(
                 "Agent is ready. Type your message and press Enter.",
@@ -266,6 +272,9 @@ class ChatApp(App):
             api_key=os.getenv("OPENAI_API_KEY"),
             api_base=os.getenv("OPENAI_API_BASE", "https://openrouter.ai/api/v1"),
         )
+
+        # 2. Store model ID
+        self.model_id = openai_server_model.model_id  # Add this line
 
         # 2. Pass the model object to the agent
         self.agent = ToolCallingAgent(
