@@ -458,7 +458,7 @@ if __name__ == "__main__":
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        filename="vibeagent.log",
+        filename="logs/vibeagent.log",
         filemode="w",
     )
     stdout_logger = logging.getLogger("STDOUT")
