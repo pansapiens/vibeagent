@@ -347,16 +347,20 @@ class ChatApp(App):
     def get_agent_response(self, user_message: str) -> None:
         """Worker to get response from agent."""
         if self.agent:
-            allowed_paths = self.settings.get("allowedPaths", [])
-            current_dir = os.getcwd()
-            context_dict = {
-                "allowedPaths": ", ".join(allowed_paths),
-                "pwd": current_dir,
-            }
-            response = self.agent.run(
-                user_message, additional_args=context_dict, reset=False
-            )
-            self.post_message(self.AgentResponse(response))
+            try:
+                allowed_paths = self.settings.get("allowedPaths", [])
+                current_dir = os.getcwd()
+                context_dict = {
+                    "allowedPaths": ", ".join(allowed_paths),
+                    "pwd": current_dir,
+                }
+                response = self.agent.run(
+                    user_message, additional_args=context_dict, reset=False
+                )
+                self.post_message(self.AgentResponse(response))
+            except Exception as e:
+                self.post_message(self.AgentResponse(f"Error: {str(e)}"))
+                logging.error(f"Agent response error: {e}", exc_info=True)
 
     def on_chat_app_agent_response(self, message: AgentResponse) -> None:
         """Handles the agent's response."""
