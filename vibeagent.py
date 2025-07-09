@@ -151,6 +151,7 @@ class ChatApp(App):
                 classes="info-message",
             )
         )
+        self.query_one("#input").focus(scroll_visible=True)
 
     def on_unmount(self) -> None:
         """Called when the app is unmounted. Disconnects the MCP client."""
@@ -340,7 +341,7 @@ class ChatApp(App):
         """Creates the layout for the chat application."""
         yield Header()
         yield ScrollableContainer(id="chat-history")
-        yield Input(placeholder="Ask the agent to do something...")
+        yield Input(id="input", placeholder="Ask the agent to do something...")
         yield Footer()
 
     def get_agent_response(self, user_message: str) -> None:
