@@ -4,7 +4,7 @@
 #   "smolagents[litellm,mcp,telemetry,toolkit]",
 #   "textual",
 #   "python-dotenv",
-#   "aider-chat",
+#   "aider-chat"
 # ]
 # ///
 
@@ -13,6 +13,7 @@ import sys
 import json
 import os
 import io
+import argparse
 from functools import partial
 from dotenv import load_dotenv
 from smolagents import ToolCallingAgent, tool, MCPClient
@@ -124,16 +125,23 @@ class ChatApp(App):
             super().__init__()
             self.tool_name = tool_name
 
-    def __init__(self):
+    def __init__(
+        self,
+        model_id: str,
+        api_key: str,
+        api_base: str = "https://openrouter.ai/api/v1",
+    ):
         super().__init__()
-        self.title = "Smol Agent Chat"
+        self.title = "Vibe Agent Chat"
         self.agent = None
         self.mcp_client = None
         self.command_history = []
         self.history_index = -1
         self.settings = {}
         self.mcp_log_files = {}  # Store MCP server log files
-        self.model_id = None  # Add this line
+        self.model_id = model_id
+        self.api_key = api_key
+        self.api_base = api_base
         self.instrumentor = SmolagentsInstrumentor() if TELEMETRY_AVAILABLE else None
         self.telemetry_is_active = False
 
@@ -215,7 +223,7 @@ class ChatApp(App):
                 classes="info-message",
             )
         )
-        self.setup_agent_and_tools()
+        self.setup_agent_and_tools(self.settings)
 
         # Log the model name during initialization
         logging.info(f"Model initialized: {self.model_id}")
@@ -241,11 +249,11 @@ class ChatApp(App):
             except:
                 pass
 
-    def setup_agent_and_tools(self):
+    def setup_agent_and_tools(self, settings):
         """Initializes the MCP client and the agent with all available tools."""
         local_tools = [aider_edit_file]
         mcp_tools = []
-        self.settings = self.load_settings()
+        self.settings = settings
         server_configs = self.settings.get("mcpServers", {})
 
         # Create logs directory structure
@@ -341,17 +349,14 @@ class ChatApp(App):
 
         all_tools = local_tools + mcp_tools
 
-        # 1. Create a dedicated OpenAI Server model object from environment variables
+        # Create a dedicated OpenAI Server model object using instance variables
         openai_server_model = OpenAIServerModel(
-            model_id=os.getenv("MODEL", "mistralai/devstral-small:free"),
-            api_key=os.getenv("OPENAI_API_KEY"),
-            api_base=os.getenv("OPENAI_API_BASE", "https://openrouter.ai/api/v1"),
+            model_id=self.model_id,
+            api_key=self.api_key,
+            api_base=self.api_base,
         )
 
-        # 2. Store model ID
-        self.model_id = openai_server_model.model_id  # Add this line
-
-        # 2. Pass the model object to the agent
+        # Pass the model object to the agent
         self.agent = ToolCallingAgent(
             model=openai_server_model,
             tools=all_tools,
@@ -359,58 +364,6 @@ class ChatApp(App):
         )
 
         self.query_one(Header).title = f"Smol Agent Chat ({len(all_tools)} Tools)"
-
-    def load_settings(self):
-        """
-        Loads server configurations from settings.json.
-        If settings.json doesn't exist, it's copied from default-settings.json.
-        Environment variables in string values are substituted in memory.
-        """
-        if not os.path.exists("settings.json"):
-            print("settings.json not found, creating from default-settings.json...")
-            if os.path.exists("default-settings.json"):
-                try:
-                    import shutil
-
-                    shutil.copyfile("default-settings.json", "settings.json")
-                except IOError as e:
-                    print(
-                        f"Error copying from default-settings.json: {e}. Creating empty settings file."
-                    )
-                    with open("settings.json", "w") as f_settings:
-                        json.dump({"mcpServers": {}}, f_settings, indent=2)
-            else:
-                print(
-                    "Warning: default-settings.json not found. Creating empty settings.json."
-                )
-                with open("settings.json", "w") as f_settings:
-                    json.dump({"mcpServers": {}}, f_settings, indent=2)
-
-        try:
-            with open("settings.json", "r") as f:
-                config = json.load(f)
-
-                def _substitute_env_vars(data):
-                    if isinstance(data, dict):
-                        return {k: _substitute_env_vars(v) for k, v in data.items()}
-                    elif isinstance(data, list):
-                        return [_substitute_env_vars(i) for i in data]
-                    elif isinstance(data, str):
-                        return os.path.expandvars(data)
-                    else:
-                        return data
-
-                config = _substitute_env_vars(config)
-                if isinstance(config, dict):
-                    return config
-                else:
-                    print(
-                        "Warning: settings.json does not contain a valid JSON object. Using empty config."
-                    )
-                    return {}
-        except (FileNotFoundError, json.JSONDecodeError) as e:
-            print(f"Error loading settings.json: {e}. Using empty config.")
-            return {}
 
     def compose(self) -> ComposeResult:
         """Creates the layout for the chat application."""
@@ -536,6 +489,103 @@ class ChatApp(App):
 
 
 if __name__ == "__main__":
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(
+        description="VibeAgent - A smolagents-based chat interface"
+    )
+    parser.add_argument(
+        "--model", help="Override the model to use (overrides settings.json and .env)"
+    )
+    parser.add_argument(
+        "--api-key-env-var",
+        help="Environment variable name to get API key from (overrides settings.json)",
+    )
+    parser.add_argument(
+        "--api-base",
+        help="Override the API base URL to use (overrides settings.json and .env)",
+    )
+    args = parser.parse_args()
+
+    # Load settings to get model configuration
+    def load_settings():
+        """Load settings from settings.json with environment variable substitution."""
+        if not os.path.exists("settings.json"):
+            print("settings.json not found, creating from default-settings.json...")
+            if os.path.exists("default-settings.json"):
+                try:
+                    import shutil
+
+                    shutil.copyfile("default-settings.json", "settings.json")
+                except IOError as e:
+                    print(
+                        f"Error copying from default-settings.json: {e}. Creating empty settings file."
+                    )
+                    with open("settings.json", "w") as f_settings:
+                        json.dump({"mcpServers": {}}, f_settings, indent=2)
+            else:
+                print(
+                    "Warning: default-settings.json not found. Creating empty settings.json."
+                )
+                with open("settings.json", "w") as f_settings:
+                    json.dump({"mcpServers": {}}, f_settings, indent=2)
+
+        try:
+            with open("settings.json", "r") as f:
+                config = json.load(f)
+
+                def _substitute_env_vars(data):
+                    if isinstance(data, dict):
+                        return {k: _substitute_env_vars(v) for k, v in data.items()}
+                    elif isinstance(data, list):
+                        return [_substitute_env_vars(i) for i in data]
+                    elif isinstance(data, str):
+                        return os.path.expandvars(data)
+                    else:
+                        return data
+
+                config = _substitute_env_vars(config)
+                if isinstance(config, dict):
+                    return config
+                else:
+                    print(
+                        "Warning: settings.json does not contain a valid JSON object. Using empty config."
+                    )
+                    return {}
+        except (FileNotFoundError, json.JSONDecodeError) as e:
+            print(f"Error loading settings.json: {e}. Using empty config.")
+            return {}
+
+    # Load settings and determine model configuration
+    settings = load_settings()
+    model_config = settings.get("model", {})
+
+    # Determine model configuration with priority: command line > settings.json > environment variables
+    model_id = args.model or model_config.get(
+        "id", os.getenv("MODEL", "mistralai/devstral-small:free")
+    )
+
+    # Handle API key with priority: command line env var > settings.json > default env vars
+    if args.api_key_env_var:
+        api_key = os.getenv(args.api_key_env_var)
+        if not api_key:
+            print(f"Error: Environment variable '{args.api_key_env_var}' is not set.")
+            sys.exit(1)
+    else:
+        api_key = model_config.get(
+            "api_key", os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENAI_API_KEY")
+        )
+
+    api_base = args.api_base or model_config.get(
+        "api_base", os.getenv("OPENAI_API_BASE", "https://openrouter.ai/api/v1")
+    )
+
+    # Validate required parameters
+    if not api_key:
+        print(
+            "Error: API key is required. Set it via --api-key-env-var, settings.json, or OPENROUTER_API_KEY/OPENAI_API_KEY environment variable."
+        )
+        sys.exit(1)
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -563,5 +613,6 @@ if __name__ == "__main__":
             """
             )
 
-    app = ChatApp()
+    app = ChatApp(model_id=model_id, api_key=api_key, api_base=api_base)
+    app.settings = settings  # Set the settings after instantiation
     app.run()

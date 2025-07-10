@@ -2,6 +2,11 @@
   "allowedPaths": [
     "$HOME/ai_workspace"
   ],
+  "model": {
+    "id": "mistralai/devstral-small:free",
+    "api_key": "$OPENROUTER_API_KEY",
+    "api_base": "https://openrouter.ai/api/v1"
+  },
   "mcpServers": {
     "filesystem": {
       "command": "npx",
