@@ -23,11 +23,17 @@ from textual.containers import ScrollableContainer
 from textual.widgets import Header, Footer, Input, Static, Markdown
 from textual.message import Message
 
-from phoenix.otel import register
-from openinference.instrumentation.smolagents import SmolagentsInstrumentor
+try:
+    from openinference.instrumentation.smolagents import SmolagentsInstrumentor
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import BatchSpanProcessor
+    from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+    from opentelemetry import trace
+    from phoenix.otel import register
 
-register()
-SmolagentsInstrumentor().instrument()
+    TELEMETRY_AVAILABLE = True
+except ImportError:
+    TELEMETRY_AVAILABLE = False
 
 
 class StreamToLogger:
@@ -128,6 +134,75 @@ class ChatApp(App):
         self.settings = {}
         self.mcp_log_files = {}  # Store MCP server log files
         self.model_id = None  # Add this line
+        self.instrumentor = SmolagentsInstrumentor() if TELEMETRY_AVAILABLE else None
+        self.telemetry_is_active = False
+
+    def _is_phoenix_running(self) -> bool:
+        import socket
+        from urllib.parse import urlparse
+
+        # Get telemetry endpoint from environment
+        telemetry_endpoint = os.getenv(
+            "OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4317"
+        )
+
+        try:
+            parsed_url = urlparse(telemetry_endpoint)
+            host = parsed_url.hostname or "localhost"
+            port = parsed_url.port or 4317
+
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(1)  # 1-second timeout
+            try:
+                result = sock.connect_ex((host, port))
+                return result == 0
+            finally:
+                sock.close()
+        except Exception:
+            return False
+
+    def _update_telemetry_status(self):
+        if (
+            not self.instrumentor
+            or os.getenv("DISABLE_TELEMETRY", "false").lower() == "true"
+        ):
+            return
+
+        is_phoenix_running = self._is_phoenix_running()
+
+        if is_phoenix_running and not self.telemetry_is_active:
+            try:
+                logging.info("Phoenix detected. Enabling telemetry...")
+                trace_provider = TracerProvider()
+
+                # Get telemetry endpoint from environment
+                telemetry_endpoint = os.getenv(
+                    "OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4317"
+                )
+                exporter = OTLPSpanExporter(endpoint=telemetry_endpoint)
+                processor = BatchSpanProcessor(
+                    exporter, max_queue_size=2048, schedule_delay_millis=5000
+                )
+                trace_provider.add_span_processor(processor)
+                trace.set_tracer_provider(trace_provider)
+                register()
+
+                self.instrumentor.instrument(tracer_provider=trace_provider)
+                self.telemetry_is_active = True
+                logging.info(f"Telemetry enabled. Endpoint: {telemetry_endpoint}")
+            except Exception as e:
+                logging.error(f"Failed to enable telemetry: {e}")
+
+        elif not is_phoenix_running and self.telemetry_is_active:
+            try:
+                logging.info("Phoenix not detected. Disabling telemetry...")
+                self.instrumentor.uninstrument()
+                self.telemetry_is_active = False
+                # Also reset the global tracer provider
+                trace.set_tracer_provider(trace.NoOpTracerProvider())
+                logging.info("Telemetry disabled.")
+            except Exception as e:
+                logging.error(f"Failed to disable telemetry: {e}")
 
     def on_mount(self) -> None:
         """Called when the app is mounted. Sets up the agent and MCP connections."""
@@ -346,6 +421,7 @@ class ChatApp(App):
 
     def get_agent_response(self, user_message: str) -> None:
         """Worker to get response from agent."""
+        self.call_from_thread(self._update_telemetry_status)
         if self.agent:
             try:
                 allowed_paths = self.settings.get("allowedPaths", [])

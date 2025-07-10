@@ -24,6 +24,24 @@ After first run, a `settings.json` will be generated. You can edit this to add o
 
 ##  Monitoring the agent, telemetry
 
+Telemetry is automatically enabled when Phoenix is running on the configured endpoint. The telemetry is non-blocking, so the application will continue to work even if Phoenix goes down mid-session.
+
+### Configuration
+
+Add these to your `.env` file:
+
+```bash
+# Telemetry endpoint (default: http://localhost:4317)
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
+
+# Disable telemetry completely
+DISABLE_TELEMETRY=false
+```
+
+### Setup
+
+To enable telemetry monitoring:
+
 ```bash
 uv venv
 source .venv/bin/activate
