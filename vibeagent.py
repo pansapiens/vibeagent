@@ -565,6 +565,41 @@ class ChatApp(App):
         )
         chat_history.scroll_end()
 
+    def _handle_command(self, user_message: str) -> bool:
+        """
+        Handles a user command.
+        Returns True if a command was handled, False otherwise.
+        """
+        parts = user_message.strip().split(" ", 1)
+        command = parts[0].lower()
+        arg = parts[1] if len(parts) > 1 else None
+        chat_history = self.query_one("#chat-history")
+
+        if command == "/quit":
+            self.exit()
+            return True
+
+        if command == "/tools":
+            self.list_tools()
+            return True
+
+        if command == "/refresh-models":
+            chat_history.mount(
+                Static("Refreshing model list from API...", classes="info-message")
+            )
+            chat_history.scroll_end()
+            self.run_worker(self.fetch_models, thread=True)
+            return True
+
+        if command == "/model":
+            if arg:
+                self.update_model(arg.strip())
+            else:
+                self.action_select_model()
+            return True
+
+        return False
+
     async def on_input_submitted(self, event: Input.Submitted) -> None:
         """Handles user input and displays the agent's response."""
         user_message = event.value.strip()
@@ -579,29 +614,7 @@ class ChatApp(App):
         self.history_index = len(self.command_history)
         chat_history.scroll_end()
 
-        if user_message.lower() == "/quit":
-            self.exit()
-            return
-
-        if user_message.lower() == "/tools":
-            self.list_tools()
-            return
-
-        if user_message.lower() == "/refresh-models":
-            chat_history.mount(
-                Static("Refreshing model list from API...", classes="info-message")
-            )
-            chat_history.scroll_end()
-            self.run_worker(self.fetch_models, thread=True)
-            return
-
-        if user_message.lower().startswith("/model"):
-            parts = user_message.split(" ", 1)
-            if len(parts) > 1 and parts[1]:
-                model_name = parts[1].strip()
-                self.update_model(model_name)
-            else:
-                self.action_select_model()
+        if user_message.startswith("/") and self._handle_command(user_message):
             return
 
         if not self.agent:
