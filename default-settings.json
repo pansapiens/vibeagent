@@ -46,6 +46,12 @@
         "--quiet",
         "pubmedmcp@latest"
       ]
+    },
+    "searxng": {
+      "command": "uvx",
+      "args": [
+        "mcp-searxng"
+      ]
     }
   }
 }
