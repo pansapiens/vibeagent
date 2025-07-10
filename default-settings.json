@@ -2,6 +2,12 @@
   "allowedPaths": [
     "$HOME/ai_workspace"
   ],
+  "favoriteModels": [
+    "mistralai/devstral-small:free",
+    "mistralai/devstral-small",
+    "mistralai/mistral-small-3.2-24b-instruct-2506:free",
+    "google/gemma-3n-e4b-it"
+  ],
   "model": {
     "id": "mistralai/devstral-small:free",
     "api_key": "$OPENROUTER_API_KEY",

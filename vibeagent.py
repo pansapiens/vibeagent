@@ -4,7 +4,8 @@
 #   "smolagents[litellm,mcp,telemetry,toolkit]",
 #   "textual",
 #   "python-dotenv",
-#   "aider-chat"
+#   "aider-chat",
+#   "openai"
 # ]
 # ///
 
@@ -20,9 +21,20 @@ from smolagents import ToolCallingAgent, tool, MCPClient
 from smolagents.models import OpenAIServerModel
 from mcp import StdioServerParameters
 from textual.app import App, ComposeResult
-from textual.containers import ScrollableContainer
-from textual.widgets import Header, Footer, Input, Static, Markdown
+from textual.containers import ScrollableContainer, Vertical
+from textual.widgets import (
+    Header,
+    Footer,
+    Input,
+    Static,
+    Markdown,
+    OptionList,
+)
+from textual.widgets.option_list import Option
 from textual.message import Message
+from textual.screen import ModalScreen
+from textual.command import Provider, Hit, Hits
+from textual.binding import Binding
 
 try:
     from openinference.instrumentation.smolagents import SmolagentsInstrumentor
@@ -102,6 +114,72 @@ def aider_edit_file(file: str, instruction: str) -> str:
         return f"Error using aider to edit {file}: {e}"
 
 
+class ModelSelectScreen(ModalScreen[str]):
+    """Screen for selecting a model."""
+
+    def __init__(
+        self, models: list[str], favorites: list[str], current_model: str
+    ) -> None:
+        super().__init__()
+        self.all_models = models
+        self.favorites = favorites
+        self.current_model = current_model
+
+    def compose(self) -> ComposeResult:
+        # separate favorite models and other models
+        fav_options = []
+        other_options = []
+
+        # Create options, favorites first
+        for model in self.all_models:
+            if model in self.favorites:
+                fav_options.append(Option(f"{model} (favorite)", id=model))
+            else:
+                other_options.append(Option(model, id=model))
+
+        # Sort favorites alphabetically and others alphabetically
+        fav_options.sort(key=lambda o: o.prompt)
+        other_options.sort(key=lambda o: o.prompt)
+
+        with Vertical(id="model-select-dialog"):
+            yield Static("Select a Model", classes="dialog-title")
+            yield OptionList(*fav_options, *other_options, id="model-select")
+
+    def on_mount(self) -> None:
+        option_list = self.query_one(OptionList)
+        # Try to highlight the current model.
+        try:
+            options = option_list.query(Option)
+            for i, option in enumerate(options):
+                if option.id == self.current_model:
+                    option_list.highlighted = i
+                    break
+        except Exception:
+            pass  # just don't highlight
+        option_list.focus()
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        """Called when an option is selected."""
+        self.dismiss(str(event.option.id))
+
+
+class ModelSelectProvider(Provider):
+    """A command provider for selecting the model."""
+
+    async def search(self, query: str) -> Hits:
+        """Search for the select model command."""
+        matcher = self.matcher(query)
+        command = "Select model"
+        score = matcher.match(command)
+        if score > 0:
+            yield Hit(
+                score,
+                matcher.highlight(command),
+                self.app.action_select_model,
+                help="Choose a different LLM to chat with.",
+            )
+
+
 class ChatApp(App):
     """A textual-based chat interface for a smolagents agent."""
 
@@ -110,6 +188,7 @@ class ChatApp(App):
         ("up", "history_prev", "Previous command"),
         ("down", "history_next", "Next command"),
     ]
+    COMMANDS = App.COMMANDS | {ModelSelectProvider}
 
     class AgentResponse(Message):
         """A message containing the agent's response."""
@@ -142,6 +221,9 @@ class ChatApp(App):
         self.model_id = model_id
         self.api_key = api_key
         self.api_base = api_base
+        self.available_models = []
+        self.favorite_models = []
+        self.all_tools = []
         self.instrumentor = SmolagentsInstrumentor() if TELEMETRY_AVAILABLE else None
         self.telemetry_is_active = False
 
@@ -212,6 +294,29 @@ class ChatApp(App):
             except Exception as e:
                 logging.error(f"Failed to disable telemetry: {e}")
 
+    async def fetch_models(self) -> None:
+        """Fetches available models from the OpenAI-compatible endpoint."""
+        try:
+            from openai import AsyncOpenAI
+
+            async with AsyncOpenAI(
+                api_key=self.api_key, base_url=self.api_base
+            ) as client:
+                models = await client.models.list()
+                self.available_models = sorted([model.id for model in models.data])
+                self.call_from_thread(
+                    self.query_one("#chat-history").mount,
+                    Static(
+                        f"Found {len(self.available_models)} available models.",
+                        classes="info-message",
+                    ),
+                )
+        except Exception as e:
+            self.call_from_thread(
+                self.query_one("#chat-history").mount,
+                Static(f"Error fetching models: {e}", classes="error-message"),
+            )
+
     def on_mount(self) -> None:
         """Called when the app is mounted. Sets up the agent and MCP connections."""
         # provider = trace.get_tracer_provider()
@@ -223,6 +328,9 @@ class ChatApp(App):
                 classes="info-message",
             )
         )
+        self.favorite_models = self.settings.get("favoriteModels", [])
+        self.run_worker(self.fetch_models, thread=True)
+
         self.setup_agent_and_tools(self.settings)
 
         # Log the model name during initialization
@@ -352,7 +460,13 @@ class ChatApp(App):
                         pass
                 self.mcp_log_files.clear()
 
-        all_tools = local_tools + mcp_tools
+        self.all_tools = local_tools + mcp_tools
+
+        self.update_agent_with_new_model(self.model_id, startup=True)
+
+    def update_agent_with_new_model(self, model_id: str, startup: bool = False):
+        """Creates a new agent with the specified model."""
+        self.model_id = model_id
 
         # Create a dedicated OpenAI Server model object using instance variables
         openai_server_model = OpenAIServerModel(
@@ -364,11 +478,18 @@ class ChatApp(App):
         # Pass the model object to the agent
         self.agent = ToolCallingAgent(
             model=openai_server_model,
-            tools=all_tools,
+            tools=self.all_tools,
             add_base_tools=True,
         )
 
-        self.query_one(Header).title = f"Smol Agent Chat ({len(all_tools)} Tools)"
+        self.query_one(Header).title = f"Vibe Agent ({self.model_id})"
+
+        if not startup:
+            chat_history = self.query_one("#chat-history")
+            chat_history.mount(
+                Static(f"Switched to model: {self.model_id}", classes="info-message")
+            )
+            logging.info(f"Model switched to: {self.model_id}")
 
     def compose(self) -> ComposeResult:
         """Creates the layout for the chat application."""
@@ -433,6 +554,15 @@ class ChatApp(App):
             self.list_tools()
             return
 
+        if user_message.lower().startswith("/model"):
+            parts = user_message.split(" ", 1)
+            if len(parts) > 1 and parts[1]:
+                model_name = parts[1].strip()
+                self.update_model(model_name)
+            else:
+                self.action_select_model()
+            return
+
         if not self.agent:
             chat_history.mount(
                 Static(
@@ -451,6 +581,37 @@ class ChatApp(App):
             thread=True,
             name=f"Agent request: {user_message[:30]}",
         )
+
+    def update_model(self, new_model_id: str):
+        """Callback to update the model."""
+        if self.available_models and new_model_id in self.available_models:
+            self.update_agent_with_new_model(new_model_id)
+        else:
+            # Check if the model exists on the server
+            self.run_worker(
+                partial(self.verify_and_update_model, new_model_id), thread=True
+            )
+
+    async def verify_and_update_model(self, model_id: str):
+        """Verify model exists and then update."""
+        try:
+            from openai import AsyncOpenAI
+
+            client = AsyncOpenAI(api_key=self.api_key, base_url=self.api_base)
+            await client.models.retrieve(model_id)
+            # It exists, update it in the main thread
+            self.call_from_thread(self.update_agent_with_new_model, model_id)
+            if model_id not in self.available_models:
+                self.available_models.append(model_id)
+                self.available_models.sort()
+
+        except Exception:
+            self.call_from_thread(
+                self.query_one("#chat-history").mount,
+                Static(
+                    f"Model '{model_id}' not found or invalid.", classes="error-message"
+                ),
+            )
 
     def list_tools(self) -> None:
         """Displays the list of available tools."""
@@ -491,6 +652,29 @@ class ChatApp(App):
         elif self.history_index == len(self.command_history) - 1:
             self.history_index += 1
             self.query_one(Input).value = ""
+
+    def action_select_model(self) -> None:
+        """Show the model selection screen."""
+        if not self.available_models:
+            self.query_one("#chat-history").mount(
+                Static(
+                    "Model list not available yet. Please try again shortly.",
+                    classes="error-message",
+                )
+            )
+            self.query_one("#chat-history").scroll_end()
+            return
+
+        def on_model_selected(model_id: str):
+            if model_id:
+                self.update_model(model_id)
+
+        self.push_screen(
+            ModelSelectScreen(
+                self.available_models, self.favorite_models, self.model_id
+            ),
+            on_model_selected,
+        )
 
 
 if __name__ == "__main__":
@@ -615,6 +799,19 @@ if __name__ == "__main__":
             .info-message { color: #8c8c8c; }
             .error-message { color: #ff6347; border-left: thick #ff6347;}
             Input { background: #3c3c3c; border: none; color: #cccccc; }
+            #model-select-dialog {
+                background: #2d2d2d;
+                padding: 1 2;
+                border: thick #3c3c3c;
+                width: 80;
+                height: auto;
+                align: center middle;
+            }
+            .dialog-title {
+                content-align: center;
+                width: 100%;
+                margin-bottom: 1;
+            }
             """
             )
 

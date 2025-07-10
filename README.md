@@ -12,6 +12,7 @@ Ask the agent to do something filesystem or search related.
 
 - `/tools` - List available tools
 - `/quit` - Quit the agent
+- `/model [name]` - Change the model. If `[name]` is omitted, a selection dialog is shown.
 
 ### Command Line Options
 
@@ -51,13 +52,18 @@ The model can be configured in multiple ways with the following priority (highes
     "id": "mistralai/devstral-small:free",
     "api_key": "$OPENROUTER_API_KEY",
     "api_base": "https://openrouter.ai/api/v1"
-  }
+  },
+  "favoriteModels": [
+    "mistralai/devstral-small:free",
+    "google/gemma-3n-e4b-it"
+  ]
 }
 ```
 
 - `id`: The model identifier (e.g., "mistralai/devstral-small:free", "google/gemma-3n-e4b-it")
 - `api_key`: Your API key (can use environment variable substitution with `$VAR_NAME`)
 - `api_base`: The API base URL (defaults to OpenRouter)
+- `favoriteModels`: A list of model IDs to show at the top of the model selection list.
 
 ##  Monitoring the agent, telemetry
 
