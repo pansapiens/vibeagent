@@ -5,7 +5,8 @@
 #   "textual",
 #   "python-dotenv",
 #   "aider-chat",
-#   "openai"
+#   "openai",
+#   "textual-autocomplete",
 # ]
 # ///
 
@@ -35,6 +36,8 @@ from textual.message import Message
 from textual.screen import ModalScreen
 from textual.command import Provider, Hit, Hits
 from textual.binding import Binding
+from textual_autocomplete import AutoComplete, DropdownItem
+from textual_autocomplete._autocomplete import TargetState
 
 try:
     from openinference.instrumentation.smolagents import SmolagentsInstrumentor
@@ -495,7 +498,9 @@ class ChatApp(App):
         """Creates the layout for the chat application."""
         yield Header()
         yield ScrollableContainer(id="chat-history")
-        yield Input(id="input", placeholder="Ask the agent to do something...")
+        input_widget = Input(id="input", placeholder="Ask the agent to do something...")
+        yield input_widget
+        yield AutoComplete(input_widget, candidates=self.get_autocomplete_candidates)
         yield Footer()
 
     def get_agent_response(self, user_message: str) -> None:
@@ -523,6 +528,34 @@ class ChatApp(App):
         chat_history.query(".agent-thinking").last().remove()
         chat_history.mount(Markdown(message.response, classes="agent-message"))
         chat_history.scroll_end()
+
+    def get_autocomplete_candidates(self, state: TargetState) -> list[DropdownItem]:
+        """Provides dynamic candidates for the autocomplete dropdown."""
+        text = state.text.lstrip()
+
+        if not text.startswith("/"):
+            return []  # No suggestions if it's not a command
+
+        if " " in text:
+            command, _ = text.split(" ", 1)
+            if command == "/model":
+                # User is typing a model name after /model
+                sorted_models = sorted(
+                    self.available_models,
+                    key=lambda model_id: (
+                        model_id not in self.favorite_models,
+                        model_id,
+                    ),
+                )
+                return [
+                    DropdownItem(f"/model {model_id}") for model_id in sorted_models
+                ]
+            else:
+                return []  # No suggestions for arguments of other commands for now
+        else:
+            # User is typing a command, textual-autocomplete will filter
+            commands = ["/quit", "/tools", "/model"]
+            return [DropdownItem(cmd) for cmd in commands]
 
     def on_chat_app_tool_call(self, message: ToolCall) -> None:
         """Handles a tool call message."""
