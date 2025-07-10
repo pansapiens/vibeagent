@@ -48,8 +48,9 @@
       ]
     },
     "searxng": {
-      "command": "uvx",
+      "command": "npx",
       "args": [
+        "-y",
         "mcp-searxng"
       ]
     }
