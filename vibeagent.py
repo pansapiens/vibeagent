@@ -554,7 +554,7 @@ class ChatApp(App):
                 return []  # No suggestions for arguments of other commands for now
         else:
             # User is typing a command, textual-autocomplete will filter
-            commands = ["/quit", "/tools", "/model"]
+            commands = ["/quit", "/tools", "/model", "/refresh-models"]
             return [DropdownItem(cmd) for cmd in commands]
 
     def on_chat_app_tool_call(self, message: ToolCall) -> None:
@@ -585,6 +585,14 @@ class ChatApp(App):
 
         if user_message.lower() == "/tools":
             self.list_tools()
+            return
+
+        if user_message.lower() == "/refresh-models":
+            chat_history.mount(
+                Static("Refreshing model list from API...", classes="info-message")
+            )
+            chat_history.scroll_end()
+            self.run_worker(self.fetch_models, thread=True)
             return
 
         if user_message.lower().startswith("/model"):
