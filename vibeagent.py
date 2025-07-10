@@ -263,6 +263,11 @@ class ChatApp(App):
         server_params = []
 
         for name, config in server_configs.items():
+            # Skip disabled servers
+            if config.get("disabled", False):
+                print(f"Skipping disabled MCP server: {name}")
+                continue
+
             command = config.get("command")
             args = config.get("args", [])
             env = config.get("env", {})
