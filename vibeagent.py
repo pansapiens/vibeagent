@@ -16,10 +16,12 @@ import json
 import os
 import io
 import argparse
+import time
 from functools import partial
 from dotenv import load_dotenv
 from smolagents import ToolCallingAgent, tool, MCPClient
-from smolagents.models import OpenAIServerModel
+from smolagents.models import OpenAIServerModel, MessageRole, ChatMessage
+from smolagents.monitoring import Timing
 from mcp import StdioServerParameters
 from textual.app import App, ComposeResult
 from textual.containers import ScrollableContainer, Vertical
@@ -38,6 +40,8 @@ from textual.command import Provider, Hit, Hits
 from textual.binding import Binding
 from textual_autocomplete import AutoComplete, DropdownItem
 from textual_autocomplete._autocomplete import TargetState
+from smolagents.memory import ActionStep, MemoryStep
+
 
 try:
     from openinference.instrumentation.smolagents import SmolagentsInstrumentor
@@ -190,6 +194,8 @@ class ChatApp(App):
     BINDINGS = [
         ("up", "history_prev", "Previous command"),
         ("down", "history_next", "Next command"),
+        ("pageup", "scroll_up", "Scroll History Up"),
+        ("pagedown", "scroll_down", "Scroll History Down"),
     ]
     COMMANDS = App.COMMANDS | {ModelSelectProvider}
 
@@ -229,6 +235,9 @@ class ChatApp(App):
         self.all_tools = []
         self.instrumentor = SmolagentsInstrumentor() if TELEMETRY_AVAILABLE else None
         self.telemetry_is_active = False
+        self.default_strategy = settings.get("contextManagementStrategy", "drop_oldest")
+        self.global_context_length = settings.get("contextLength", 8192)
+        self.model_context_lengths = {}  # Initialize model_context_lengths
 
     def _is_phoenix_running(self) -> bool:
         import socket
@@ -307,6 +316,10 @@ class ChatApp(App):
             ) as client:
                 models = await client.models.list()
                 self.available_models = sorted([model.id for model in models.data])
+                self.model_context_lengths = {
+                    model.id: getattr(model, "context_length", None)
+                    for model in models.data
+                }
                 self.call_from_thread(
                     self.query_one("#chat-history").mount,
                     Static(
@@ -470,6 +483,11 @@ class ChatApp(App):
     def update_agent_with_new_model(self, model_id: str, startup: bool = False):
         """Creates a new agent with the specified model."""
         self.model_id = model_id
+        context_length = self.model_context_lengths.get(model_id)
+        self.max_context_length = (
+            context_length if context_length is not None else self.global_context_length
+        )
+        self.context_threshold = int(self.max_context_length * 0.8)
 
         # Create a dedicated OpenAI Server model object using instance variables
         openai_server_model = OpenAIServerModel(
@@ -550,11 +568,16 @@ class ChatApp(App):
                 return [
                     DropdownItem(f"/model {model_id}") for model_id in sorted_models
                 ]
+            elif command == "/compress":
+                strategies = ["drop_oldest", "middle_out", "summarize"]
+                return [
+                    DropdownItem(f"/compress {strategy}") for strategy in strategies
+                ]
             else:
                 return []  # No suggestions for arguments of other commands for now
         else:
             # User is typing a command, textual-autocomplete will filter
-            commands = ["/quit", "/tools", "/model", "/refresh-models"]
+            commands = ["/quit", "/tools", "/model", "/refresh-models", "/compress"]
             return [DropdownItem(cmd) for cmd in commands]
 
     def on_chat_app_tool_call(self, message: ToolCall) -> None:
@@ -597,7 +620,10 @@ class ChatApp(App):
             else:
                 self.action_select_model()
             return True
-
+        if command == "/compress":
+            strategy = arg.strip() if arg else self.default_strategy
+            self.compress_context(strategy)
+            return True
         return False
 
     async def on_input_submitted(self, event: Input.Submitted) -> None:
@@ -652,7 +678,10 @@ class ChatApp(App):
             from openai import AsyncOpenAI
 
             client = AsyncOpenAI(api_key=self.api_key, base_url=self.api_base)
-            await client.models.retrieve(model_id)
+            details = await client.models.retrieve(model_id)
+            ctx_len = getattr(details, "context_length", None)
+            if ctx_len:
+                self.model_context_lengths[model_id] = ctx_len
             # It exists, update it in the main thread
             self.call_from_thread(self.update_agent_with_new_model, model_id)
             if model_id not in self.available_models:
@@ -707,6 +736,14 @@ class ChatApp(App):
             self.history_index += 1
             self.query_one(Input).value = ""
 
+    def action_scroll_up(self) -> None:
+        """Scroll the chat history up."""
+        self.query_one("#chat-history").scroll_page_up()
+
+    def action_scroll_down(self) -> None:
+        """Scroll the chat history down."""
+        self.query_one("#chat-history").scroll_page_down()
+
     def action_select_model(self) -> None:
         """Show the model selection screen."""
         if not self.available_models:
@@ -729,6 +766,104 @@ class ChatApp(App):
             ),
             on_model_selected,
         )
+
+    def get_current_context_tokens(self) -> int:
+        """Calculates the total token count from the agent's memory."""
+        if not self.agent or not self.agent.memory.steps:
+            return 0
+
+        total_tokens = 0
+        for step in self.agent.memory.steps:
+            if hasattr(step, "token_usage") and step.token_usage:
+                total_tokens += step.token_usage.total_tokens
+        return total_tokens
+
+    def compress_context(self, strategy: str):
+        if not self.agent:
+            self.query_one("#chat-history").mount(
+                Static("Agent is not initialized.", classes="error-message")
+            )
+            return
+
+        if strategy not in ["drop_oldest", "middle_out", "summarize"]:
+            self.query_one("#chat-history").mount(
+                Static(f"Unknown strategy: {strategy}", classes="error-message")
+            )
+            return
+
+        initial_tokens = self.get_current_context_tokens()
+
+        # if current_tokens <= self.context_threshold:
+        #     self.query_one("#chat-history").mount(
+        #         Static("Context is already under limit.", classes="info-message")
+        #     )
+        #     return
+
+        chat_history = self.query_one("#chat-history")
+
+        # Display status message
+        if strategy == "summarize":
+            status_text = "Summarizing and compressing context..."
+        else:
+            status_text = f"Compressing context using {strategy}..."
+
+        status_widget = Static(status_text, classes="agent-thinking")
+        chat_history.mount(status_widget)
+        chat_history.scroll_end()
+
+        # Perform compression
+        if strategy == "drop_oldest":
+            current_tokens = initial_tokens
+            while (
+                current_tokens > self.context_threshold
+                and len(self.agent.memory.steps) > 1
+            ):
+                self.agent.memory.steps.pop(0)
+                current_tokens = self.get_current_context_tokens()
+        elif strategy == "middle_out":
+            current_tokens = initial_tokens
+            steps = self.agent.memory.steps
+            while current_tokens > self.context_threshold and len(steps) > 2:
+                middle = len(steps) // 2
+                del steps[middle]
+                current_tokens = self.get_current_context_tokens()
+        elif strategy == "summarize":
+            messages = self.agent.write_memory_to_messages()
+            history_text = "\n".join(
+                [
+                    f"{m.role.value}: {''.join(c['text'] if isinstance(c, dict) and 'text' in c else str(c) for c in (m.content if isinstance(m.content, list) else [m.content]))}"
+                    for m in messages
+                ]
+            )
+            summary_prompt = f"Summarize the following conversation history concisely while retaining key information:\n\n{history_text}"
+            summary_message = self.agent.model.generate(
+                [ChatMessage(role=MessageRole.USER, content=summary_prompt)]
+            )
+            summary = summary_message.content
+            timing = Timing(start_time=time.time())
+            timing.end_time = time.time()
+            summary_step = ActionStep(
+                step_number=1,
+                timing=timing,
+                model_output="Conversation summary:",
+                observations=summary,
+                token_usage=summary_message.token_usage,
+            )
+            self.agent.memory.steps = [summary_step]
+            self.agent.step_number = 2
+
+        # Remove status message
+        status_widget.remove()
+
+        # Display final result
+        new_tokens = self.get_current_context_tokens()
+        chat_history.mount(
+            Static(
+                f"Context compressed from {initial_tokens} to {new_tokens} tokens.",
+                classes="info-message",
+            )
+        )
+        chat_history.scroll_end()
 
 
 if __name__ == "__main__":
