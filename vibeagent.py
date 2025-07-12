@@ -21,6 +21,7 @@ import random
 import string
 from functools import partial
 from dotenv import load_dotenv
+from contextlib import redirect_stdout
 from smolagents import ToolCallingAgent, tool, MCPClient
 from smolagents.models import OpenAIServerModel, MessageRole, ChatMessage, TokenUsage
 from smolagents.monitoring import Timing
@@ -103,6 +104,7 @@ class StreamToLogger:
     def __init__(self, logger, level):
         self.logger = logger
         self.level = level
+        self.encoding = "utf-8"
 
     def write(self, buf):
         for line in buf.rstrip().splitlines():
@@ -114,50 +116,6 @@ class StreamToLogger:
 
 # Load environment variables from .env file
 load_dotenv()
-
-
-@tool
-def aider_edit_file(file: str, instruction: str) -> str:
-    """
-    Edits a file using the aider tool with a given instruction.
-    Args:
-        file: The path to the file to edit.
-        instruction: The instruction message to pass to aider for the edit.
-    """
-    try:
-        # Import aider dependencies here to avoid circular dependencies and keep startup fast
-        from aider.client import AiderClient
-        from aider.io import IO
-
-        # Capture aider's output
-        output_capture = io.StringIO()
-
-        def capture_output(text, **kwargs):
-            output_capture.write(text)
-            if not text.endswith("\n"):
-                output_capture.write("\n")
-
-        # Setup custom IO for aider
-        aider_io = IO(
-            user_output_callback=capture_output,
-            confirm_ask=lambda: True,  # Auto-confirm any prompts
-        )
-
-        # Make sure API keys are loaded for aider
-        load_dotenv()
-        client = AiderClient(fnames=[file], yes=True, io=aider_io)
-        client.run_chat(with_message=instruction)
-
-        result_output = output_capture.getvalue()
-        output_capture.close()
-
-        return f"Aider edit log for {file}:\n{result_output}"
-    except ImportError:
-        return (
-            "Error: 'aider-chat' is not installed. Please install it to use this tool."
-        )
-    except Exception as e:
-        return f"Error using aider to edit {file}: {e}"
 
 
 class ModelSelectScreen(ModalScreen[str]):
@@ -691,6 +649,50 @@ class ChatApp(App):
 
     def setup_agent_and_tools(self, settings):
         """Initializes the MCP client and the agent with all available tools."""
+
+        class CaptureIO(io.StringIO):
+            encoding = "utf-8"
+
+        @tool
+        def aider_edit_file(file: str, instruction: str) -> str:
+            """
+            Edits a file using the aider tool with a given instruction.
+            Args:
+                file: The path to the file to edit.
+                instruction: The instruction message to pass to aider for the edit.
+            """
+            output_capture = CaptureIO()
+            try:
+                with redirect_stdout(output_capture):
+                    # Import aider dependencies here to avoid circular dependencies and keep startup fast
+                    from aider.coders import Coder
+                    from aider.models import Model
+
+                    # Setup model and coder
+                    model = Model(self.model_id)
+
+                    # Add our api key and base to the model's extra_params
+                    if not model.extra_params:
+                        model.extra_params = {}
+                    model.extra_params.update(
+                        {
+                            "api_key": self.api_key,
+                            "api_base": self.api_base,
+                            "custom_llm_provider": "openai",
+                        }
+                    )
+
+                    coder = Coder.create(main_model=model, fnames=[file])
+
+                    # Run the instruction
+                    coder.run(instruction)
+
+                result_output = output_capture.getvalue()
+                return f"Aider edit log for {file}:\n{result_output}"
+            except Exception as e:
+                error_output = output_capture.getvalue()
+                return f"Error using aider to edit {file}: {e}\nCaptured output:\n{error_output}"
+
         local_tools = [aider_edit_file]
         self.tools_by_source = {"inbuilt": local_tools}
         mcp_tools = []
