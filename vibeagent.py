@@ -17,6 +17,8 @@ import os
 import io
 import argparse
 import time
+import random
+import string
 from functools import partial
 from dotenv import load_dotenv
 from smolagents import ToolCallingAgent, tool, MCPClient
@@ -347,6 +349,159 @@ class ChatApp(App):
     ]
     COMMANDS = App.COMMANDS | {ModelSelectProvider}
 
+    # Characters from Unicode's "Combining Diacritical Marks" block
+    # as mentioned in https://en.wikipedia.org/wiki/Zalgo_text
+    ZALGO_UP = [
+        "\u030d",
+        "\u030e",
+        "\u0304",
+        "\u0305",
+        "\u033f",
+        "\u0311",
+        "\u0306",
+        "\u0310",
+        "\u0352",
+        "\u0357",
+        "\u0351",
+        "\u0307",
+        "\u0308",
+        "\u030a",
+        "\u0342",
+        "\u0343",
+        "\u0344",
+        "\u034a",
+        "\u034b",
+        "\u034c",
+        "\u0303",
+        "\u0302",
+        "\u030c",
+        "\u0350",
+        "\u0300",
+        "\u0301",
+        "\u030b",
+        "\u030f",
+        "\u0312",
+        "\u0313",
+        "\u0314",
+        "\u033d",
+        "\u0309",
+        "\u0363",
+        "\u0364",
+        "\u0365",
+        "\u0366",
+        "\u0367",
+        "\u0368",
+        "\u0369",
+        "\u036a",
+        "\u036b",
+        "\u036c",
+        "\u036d",
+        "\u036e",
+        "\u036f",
+        "\u033e",
+        "\u035b",
+        "\u0346",
+        "\u031a",
+    ]
+    ZALGO_DOWN = [
+        "\u0316",
+        "\u0317",
+        "\u0318",
+        "\u0319",
+        "\u031c",
+        "\u031d",
+        "\u031e",
+        "\u031f",
+        "\u0320",
+        "\u0324",
+        "\u0325",
+        "\u0326",
+        "\u0329",
+        "\u032a",
+        "\u032b",
+        "\u032c",
+        "\u032d",
+        "\u032e",
+        "\u032f",
+        "\u0330",
+        "\u0331",
+        "\u0332",
+        "\u0333",
+        "\u0339",
+        "\u033a",
+        "\u033b",
+        "\u033c",
+        "\u0345",
+        "\u0347",
+        "\u0348",
+        "\u0349",
+        "\u034d",
+        "\u034e",
+        "\u0353",
+        "\u0354",
+        "\u0355",
+        "\u0356",
+        "\u0359",
+        "\u035a",
+        "\u0323",
+    ]
+    ZALGO_MID = [
+        "\u0315",
+        "\u031b",
+        "\u0340",
+        "\u0341",
+        "\u0358",
+        "\u0321",
+        "\u0322",
+        "\u0327",
+        "\u0328",
+        "\u0334",
+        "\u0335",
+        "\u0336",
+        "\u034f",
+        "\u035c",
+        "\u035d",
+        "\u035e",
+        "\u035f",
+        "\u0360",
+        "\u0362",
+        "\u0338",
+        "\u0337",
+        "\u0361",
+        "\u0489",
+    ]
+
+    LEETSPEAK_MAP = {
+        "a": "4",
+        "A": "4",
+        "b": "8",
+        "B": "8",
+        "e": "3",
+        "E": "3",
+        "g": "6",
+        "G": "6",
+        "i": "1",
+        "I": "1",
+        "o": "0",
+        "O": "0",
+        "s": "5",
+        "S": "5",
+        "t": "7",
+        "T": "7",
+        "z": "2",
+        "Z": "2",
+        "l": "1",
+        "L": "1",
+    }
+
+    # Printable characters from various "safe" Unicode blocks above ASCII
+    HIGH_ASCII_CHARS = (
+        [chr(i) for i in range(0x00A1, 0x0100)]  # Latin-1 Supplement
+        + [chr(i) for i in range(0x2500, 0x2580)]  # Box Drawing
+        + [chr(i) for i in range(0x2588, 0x25A0)]  # Block Elements (skip some)
+        + [chr(i) for i in range(0x25A0, 0x2600)]  # Geometric Shapes
+    )
+
     class AgentResponse(Message):
         """A message containing the agent's response."""
 
@@ -390,6 +545,8 @@ class ChatApp(App):
         self.global_context_length = self.settings.get("contextLength", 8192)
         self.model_context_lengths = {}  # Initialize model_context_lengths
         self.is_loading = False
+        self.glitch_mode = False
+        self.glitch_strength = 0.10
 
     def _is_phoenix_running(self) -> bool:
         import socket
@@ -706,7 +863,12 @@ class ChatApp(App):
 
         chat_history = self.query_one("#chat-history")
         chat_history.query(".agent-thinking").last().remove()
-        chat_history.mount(Markdown(message.response, classes="agent-message"))
+
+        response_text = message.response
+        if self.glitch_mode:
+            response_text = self._apply_glitch(response_text)
+
+        chat_history.mount(Markdown(response_text, classes="agent-message"))
         chat_history.scroll_end()
 
     def get_autocomplete_candidates(self, state: TargetState) -> list[DropdownItem]:
@@ -769,6 +931,33 @@ class ChatApp(App):
 
         if command == "/quit":
             self.exit()
+            return True
+
+        if command == "/xyzzy":
+            strength_str = arg.strip() if arg else None
+            message = ""
+
+            if strength_str:
+                # Argument provided: set strength and ensure mode is on.
+                try:
+                    strength = float(strength_str)
+                    if 0 <= strength <= 100:
+                        self.glitch_mode = True
+                        self.glitch_strength = strength / 100.0
+                        message = f"Glitch mode enabled. Strength set to {strength}%."
+                    else:
+                        message = "Glitch strength must be between 0 and 100."
+                except ValueError:
+                    message = f"Invalid strength value: '{strength_str}'. Please provide a number."
+            else:
+                # No argument: toggle mode.
+                self.glitch_mode = not self.glitch_mode
+                message = (
+                    f"Glitch mode {'enabled' if self.glitch_mode else 'disabled'}."
+                )
+
+            # chat_history.mount(Static(message, classes="info-message"))
+            # chat_history.scroll_end()
             return True
 
         if command == "/tools":
@@ -1132,6 +1321,60 @@ class ChatApp(App):
             )
         )
         chat_history.scroll_end()
+
+    def _apply_glitch(self, text: str) -> str:
+        """Corrupts text with Zalgo and other glitches."""
+        glitched_chars = []
+        for char in text:
+            # Don't glitch whitespace
+            if not char.strip():
+                glitched_chars.append(char)
+                continue
+
+            # Roll for a glitch
+            if random.random() < self.glitch_strength:
+                glitch_type = random.choice(
+                    ["delete", "substitute", "replace_high", "zalgo", "leetspeak"]
+                )
+
+                if glitch_type == "delete":
+                    continue  # Skip appending
+
+                elif glitch_type == "substitute":
+                    glitched_chars.append(
+                        random.choice(
+                            string.ascii_letters + string.digits + string.punctuation
+                        )
+                    )
+
+                elif glitch_type == "replace_high":
+                    glitched_chars.append(random.choice(self.HIGH_ASCII_CHARS))
+
+                elif glitch_type == "leetspeak":
+                    glitched_chars.append(self.LEETSPEAK_MAP.get(char, char))
+
+                elif glitch_type == "zalgo":
+                    # Start with the original character
+                    zalgoed_char = char
+                    # Determine intensity
+                    max_diacritics = 1 + int(self.glitch_strength * 30)
+
+                    # Add UP diacritics
+                    for _ in range(random.randint(0, max_diacritics)):
+                        zalgoed_char += random.choice(self.ZALGO_UP)
+                    # Add MID diacritics
+                    for _ in range(random.randint(0, max_diacritics // 2)):
+                        zalgoed_char += random.choice(self.ZALGO_MID)
+                    # Add DOWN diacritics
+                    for _ in range(random.randint(0, max_diacritics)):
+                        zalgoed_char += random.choice(self.ZALGO_DOWN)
+
+                    glitched_chars.append(zalgoed_char)
+
+            else:  # No glitch
+                glitched_chars.append(char)
+
+        return "".join(glitched_chars)
 
 
 if __name__ == "__main__":
