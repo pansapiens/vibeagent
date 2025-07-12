@@ -346,6 +346,7 @@ class ChatApp(App):
         ("down", "history_next", "Next command"),
         ("pageup", "scroll_up", "Scroll History Up"),
         ("pagedown", "scroll_down", "Scroll History Down"),
+        ("escape", "cancel_request", "Cancel Request"),
     ]
     COMMANDS = App.COMMANDS | {ModelSelectProvider}
 
@@ -545,6 +546,7 @@ class ChatApp(App):
         self.global_context_length = self.settings.get("contextLength", 8192)
         self.model_context_lengths = {}  # Initialize model_context_lengths
         self.is_loading = False
+        self.agent_worker = None
         self.glitch_mode = False
         self.glitch_strength = 0.10
 
@@ -858,7 +860,12 @@ class ChatApp(App):
 
     def on_chat_app_agent_response(self, message: AgentResponse) -> None:
         """Handles the agent's response."""
+        # If the worker is None, it means the job was cancelled.
+        if self.agent_worker is None:
+            return
+
         self.is_loading = False
+        self.agent_worker = None
         self.query_one(Input).placeholder = "Ask the agent to do something..."
 
         chat_history = self.query_one("#chat-history")
@@ -1023,7 +1030,7 @@ class ChatApp(App):
         chat_history.mount(LoadingIndicator(classes="agent-thinking"))
         chat_history.scroll_end()
 
-        self.run_worker(
+        self.agent_worker = self.run_worker(
             partial(self.get_agent_response, user_message),
             thread=True,
             name=f"Agent request: {user_message[:30]}",
@@ -1161,6 +1168,24 @@ class ChatApp(App):
             ),
             on_model_selected,
         )
+
+    def action_cancel_request(self) -> None:
+        """Cancels the current in-progress agent request."""
+        if self.is_loading and self.agent_worker:
+            self.agent_worker.cancel()
+            self.is_loading = False
+            self.agent_worker = None
+
+            chat_history = self.query_one("#chat-history")
+            # Remove the thinking indicator
+            try:
+                chat_history.query(".agent-thinking").last().remove()
+            except Exception:
+                pass  # It might have already been removed
+
+            chat_history.mount(Static("Request cancelled.", classes="info-message"))
+            self.query_one(Input).placeholder = "Ask the agent to do something..."
+            chat_history.scroll_end()
 
     def get_current_context_tokens(self) -> int:
         """Calculates the total token count from the agent's memory."""
