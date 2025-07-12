@@ -122,12 +122,17 @@ class ModelSelectScreen(ModalScreen[str]):
     """Screen for selecting a model."""
 
     def __init__(
-        self, models: list[str], favorites: list[str], current_model: str
+        self,
+        models: list[str],
+        favorites: list[str],
+        current_model: str,
+        model_details: dict,
     ) -> None:
         super().__init__()
         self.all_models = models
         self.favorites = favorites
         self.current_model = current_model
+        self.model_details = model_details
 
     def compose(self) -> ComposeResult:
         # separate favorite models and other models
@@ -135,11 +140,19 @@ class ModelSelectScreen(ModalScreen[str]):
         other_options = []
 
         # Create options, favorites first
-        for model in self.all_models:
-            if model in self.favorites:
-                fav_options.append(Option(f"{model} (favorite)", id=model))
+        for model_id in self.all_models:
+            # Use display_id for the list, but check against original_id for favorites.
+            details = self.model_details.get(model_id)
+            if not details:
+                # Should not happen if fetch_models is working correctly, but good to be safe
+                other_options.append(Option(model_id, id=model_id))
+                continue
+
+            original_id = details.get("original_id", model_id)
+            if original_id in self.favorites:
+                fav_options.append(Option(f"{model_id} (favorite)", id=model_id))
             else:
-                other_options.append(Option(model, id=model))
+                other_options.append(Option(model_id, id=model_id))
 
         # Sort favorites alphabetically and others alphabetically
         fav_options.sort(key=lambda o: o.prompt)
@@ -477,9 +490,8 @@ class ChatApp(App):
 
     def __init__(
         self,
-        model_id: str,
-        api_key: str,
-        api_base: str = "https://openrouter.ai/api/v1",
+        model_config: dict,
+        initial_model_id: str,
     ):
         super().__init__()
         self.title = "Vibe Agent Chat"
@@ -489,9 +501,8 @@ class ChatApp(App):
         self.history_index = -1
         self.settings = {}
         self.mcp_log_files = {}  # Store MCP server log files
-        self.model_id = model_id
-        self.api_key = api_key
-        self.api_base = api_base
+        self.model_config = model_config
+        self.model_id = initial_model_id
         self.available_models = []
         self.favorite_models = []
         self.all_tools = []
@@ -502,7 +513,8 @@ class ChatApp(App):
             "contextManagementStrategy", "drop_oldest"
         )
         self.global_context_length = self.settings.get("contextLength", 8192)
-        self.model_context_lengths = {}  # Initialize model_context_lengths
+        self.model_context_lengths = {}
+        self.model_details = {}  # Stores provider, api_key, etc. for each model
         self.is_loading = False
         self.agent_worker = None
         self.glitch_mode = False
@@ -576,31 +588,83 @@ class ChatApp(App):
                 logging.error(f"Failed to disable telemetry: {e}")
 
     async def fetch_models(self) -> None:
-        """Fetches available models from the OpenAI-compatible endpoint."""
-        try:
-            from openai import AsyncOpenAI
+        """Fetches available models from all enabled OpenAI-compatible endpoints."""
+        from openai import AsyncOpenAI
 
-            async with AsyncOpenAI(
-                api_key=self.api_key, base_url=self.api_base
-            ) as client:
-                models = await client.models.list()
-                self.available_models = sorted([model.id for model in models.data])
-                self.model_context_lengths = {
-                    model.id: getattr(model, "context_length", None)
-                    for model in models.data
-                }
+        endpoints = self.model_config.get("endpoints", {})
+        if not endpoints:
+            self.call_from_thread(
+                self.query_one("#chat-history").mount,
+                Static(
+                    "No model endpoints configured in settings.",
+                    classes="error-message",
+                ),
+            )
+            return
+
+        all_models_by_provider = {}
+        model_id_counts = {}
+
+        for provider_name, config in endpoints.items():
+            if not config.get("enabled", False):
+                continue
+            try:
+                api_key = config.get("api_key")
+                api_base = config.get("api_base")
+                if not api_key or not api_base:
+                    logging.warning(
+                        f"Skipping provider {provider_name}: missing api_key or api_base."
+                    )
+                    continue
+
+                async with AsyncOpenAI(api_key=api_key, base_url=api_base) as client:
+                    models_response = await client.models.list()
+                    provider_models = models_response.data
+                    all_models_by_provider[provider_name] = provider_models
+                    for model in provider_models:
+                        model_id_counts[model.id] = model_id_counts.get(model.id, 0) + 1
+            except Exception as e:
                 self.call_from_thread(
                     self.query_one("#chat-history").mount,
                     Static(
-                        f"Found {len(self.available_models)} available models.",
-                        classes="info-message",
+                        f"Error fetching models from {provider_name}: {e}",
+                        classes="error-message",
                     ),
                 )
-        except Exception as e:
-            self.call_from_thread(
-                self.query_one("#chat-history").mount,
-                Static(f"Error fetching models: {e}", classes="error-message"),
-            )
+                logging.error(f"Error fetching models from {provider_name}: {e}")
+
+        new_available_models = []
+        new_model_context_lengths = {}
+        new_model_details = {}
+
+        for provider_name, models in all_models_by_provider.items():
+            provider_config = endpoints[provider_name]
+            for model in models:
+                is_duplicate = model_id_counts.get(model.id, 1) > 1
+                display_id = f"{provider_name}/{model.id}" if is_duplicate else model.id
+
+                new_available_models.append(display_id)
+                new_model_context_lengths[display_id] = getattr(
+                    model, "context_length", None
+                )
+                new_model_details[display_id] = {
+                    "provider": provider_name,
+                    "original_id": model.id,
+                    "api_key": provider_config["api_key"],
+                    "api_base": provider_config["api_base"],
+                }
+
+        self.available_models = sorted(list(set(new_available_models)))
+        self.model_context_lengths = new_model_context_lengths
+        self.model_details = new_model_details
+
+        self.call_from_thread(
+            self.query_one("#chat-history").mount,
+            Static(
+                f"Found {len(self.available_models)} available models from {len(all_models_by_provider)} provider(s).",
+                classes="info-message",
+            ),
+        )
 
     def on_mount(self) -> None:
         """Called when the app is mounted. Sets up the agent and MCP connections."""
@@ -663,21 +727,26 @@ class ChatApp(App):
             """
             output_capture = CaptureIO()
             try:
+                # Get the provider details for the current model
+                model_details = self.model_details.get(self.model_id)
+                if not model_details:
+                    return f"Error: Could not find model details for {self.model_id}. Cannot run aider."
+
                 with redirect_stdout(output_capture):
                     # Import aider dependencies here to avoid circular dependencies and keep startup fast
                     from aider.coders import Coder
                     from aider.models import Model
 
                     # Setup model and coder
-                    model = Model(self.model_id)
+                    model = Model(model_details["original_id"])
 
                     # Add our api key and base to the model's extra_params
                     if not model.extra_params:
                         model.extra_params = {}
                     model.extra_params.update(
                         {
-                            "api_key": self.api_key,
-                            "api_base": self.api_base,
+                            "api_key": model_details["api_key"],
+                            "api_base": model_details["api_base"],
                             "custom_llm_provider": "openai",
                         }
                     )
@@ -802,6 +871,17 @@ class ChatApp(App):
 
     def update_agent_with_new_model(self, model_id: str, startup: bool = False):
         """Creates a new agent with the specified model."""
+        if model_id not in self.model_details:
+            if not startup:
+                self.query_one("#chat-history").mount(
+                    Static(
+                        f"Error: Details for model '{model_id}' not found.",
+                        classes="error-message",
+                    )
+                )
+            # Don't proceed if we don't have details. fetch_models should run first.
+            return
+
         self.model_id = model_id
         context_length = self.model_context_lengths.get(model_id)
         self.max_context_length = (
@@ -809,11 +889,14 @@ class ChatApp(App):
         )
         self.context_threshold = int(self.max_context_length * 0.8)
 
+        # Get provider-specific details for the selected model
+        details = self.model_details[model_id]
+
         # Create a dedicated OpenAI Server model object using instance variables
         openai_server_model = OpenAIServerModel(
-            model_id=self.model_id,
-            api_key=self.api_key,
-            api_base=self.api_base,
+            model_id=details["original_id"],
+            api_key=details["api_key"],
+            api_base=details["api_base"],
         )
 
         # Pass the model object to the agent
@@ -1050,27 +1133,29 @@ class ChatApp(App):
 
     async def verify_and_update_model(self, model_id: str):
         """Verify model exists and then update."""
-        try:
-            from openai import AsyncOpenAI
+        from openai import AsyncOpenAI
 
-            client = AsyncOpenAI(api_key=self.api_key, base_url=self.api_base)
-            details = await client.models.retrieve(model_id)
-            ctx_len = getattr(details, "context_length", None)
-            if ctx_len:
-                self.model_context_lengths[model_id] = ctx_len
-            # It exists, update it in the main thread
+        # This command is now more complex. A user might type `/model my-model`
+        # or `/model provider/my-model`.
+        # For now, we will rely on the periodic `fetch_models` to discover models.
+        # This function will just check if the model is in our available list.
+
+        chat_history = self.query_one("#chat-history")
+        if model_id in self.available_models:
             self.call_from_thread(self.update_agent_with_new_model, model_id)
-            if model_id not in self.available_models:
-                self.available_models.append(model_id)
-                self.available_models.sort()
-
-        except Exception:
-            self.call_from_thread(
-                self.query_one("#chat-history").mount,
-                Static(
-                    f"Model '{model_id}' not found or invalid.", classes="error-message"
-                ),
-            )
+        else:
+            # Try to refresh models to see if it's new
+            await self.fetch_models()
+            if model_id in self.available_models:
+                self.call_from_thread(self.update_agent_with_new_model, model_id)
+            else:
+                self.call_from_thread(
+                    chat_history.mount,
+                    Static(
+                        f"Model '{model_id}' not found after refreshing. Please check the name or provider.",
+                        classes="error-message",
+                    ),
+                )
 
     def list_tools(self) -> None:
         """Displays the list of available tools."""
@@ -1166,7 +1251,10 @@ class ChatApp(App):
 
         self.push_screen(
             ModelSelectScreen(
-                self.available_models, self.favorite_models, self.model_id
+                self.available_models,
+                self.favorite_models,
+                self.model_id,
+                self.model_details,
             ),
             on_model_selected,
         )
@@ -1297,10 +1385,11 @@ class ChatApp(App):
             """.strip()
 
             # Create a dedicated summarization agent
+            summary_model_details = self.model_details[self.model_id]
             summarizer_model = OpenAIServerModel(
-                model_id=self.model_id,
-                api_key=self.api_key,
-                api_base=self.api_base,
+                model_id=summary_model_details["original_id"],
+                api_key=summary_model_details["api_key"],
+                api_base=summary_model_details["api_base"],
             )
             summarizer_agent = ToolCallingAgent(
                 model=summarizer_model,
@@ -1410,16 +1499,9 @@ if __name__ == "__main__":
         description="VibeAgent - A smolagents-based chat interface"
     )
     parser.add_argument(
-        "--model", help="Override the model to use (overrides settings.json and .env)"
+        "--model", help="Override the default model to use (from settings.json)"
     )
-    parser.add_argument(
-        "--api-key-env-var",
-        help="Environment variable name to get API key from (overrides settings.json)",
-    )
-    parser.add_argument(
-        "--api-base",
-        help="Override the API base URL to use (overrides settings.json and .env)",
-    )
+    # --api-key-env-var and --api-base are removed as they are now endpoint-specific
     args = parser.parse_args()
 
     # Load settings to get model configuration
@@ -1473,33 +1555,19 @@ if __name__ == "__main__":
 
     # Load settings and determine model configuration
     settings = load_settings()
-    model_config = settings.get("model", {})
+    model_config = settings
 
-    # Determine model configuration with priority: command line > settings.json > environment variables
-    model_id = args.model or model_config.get(
-        "id", os.getenv("MODEL", "mistralai/devstral-small:free")
-    )
+    # Determine the initial model to use
+    initial_model_id = args.model or model_config.get("defaultModel")
 
-    # Handle API key with priority: command line env var > settings.json > default env vars
-    if args.api_key_env_var:
-        api_key = os.getenv(args.api_key_env_var)
-        if not api_key:
-            print(f"Error: Environment variable '{args.api_key_env_var}' is not set.")
-            sys.exit(1)
-    else:
-        api_key = model_config.get(
-            "api_key", os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENAI_API_KEY")
-        )
-
-    api_base = args.api_base or model_config.get(
-        "api_base", os.getenv("OPENAI_API_BASE", "https://openrouter.ai/api/v1")
-    )
-
-    # Validate required parameters
-    if not api_key:
+    if not initial_model_id:
         print(
-            "Error: API key is required. Set it via --api-key-env-var, settings.json, or OPENROUTER_API_KEY/OPENAI_API_KEY environment variable."
+            "Error: No default model specified in settings.json and --model not provided."
         )
+        sys.exit(1)
+
+    if not model_config.get("endpoints"):
+        print("Error: No model endpoints configured in settings.json.")
         sys.exit(1)
 
     logging.basicConfig(
@@ -1514,6 +1582,6 @@ if __name__ == "__main__":
     sys.stderr = StreamToLogger(stderr_logger, logging.ERROR)
     print("--- VibeAgent session started, logging to vibeagent.log ---")
 
-    app = ChatApp(model_id=model_id, api_key=api_key, api_base=api_base)
+    app = ChatApp(model_config=model_config, initial_model_id=initial_model_id)
     app.settings = settings  # Set the settings after instantiation
     app.run()
