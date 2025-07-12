@@ -32,10 +32,12 @@ from textual.widgets import (
     Static,
     Markdown,
     OptionList,
+    LoadingIndicator,
 )
 from textual.widgets.option_list import Option
 from textual.message import Message
 from textual.screen import ModalScreen
+from textual.theme import Theme
 from textual.command import Provider, Hit, Hits
 from textual.binding import Binding
 from textual_autocomplete import AutoComplete, DropdownItem
@@ -54,6 +56,41 @@ try:
     TELEMETRY_AVAILABLE = True
 except ImportError:
     TELEMETRY_AVAILABLE = False
+
+
+cyberpunk_theme = Theme(
+    name="cyberpunk",
+    primary="#00FFFF",  # Electric Blue
+    secondary="#FF00FF",  # Vivid Pink
+    accent="#CC00CC",  # Deep Purple
+    warning="#FFA500",  # Orange
+    error="#FF4500",  # OrangeRed
+    success="#00FF00",  # Luminescent Green
+    foreground="#E0E0E0",
+    background="#101010",
+    surface="#1A1A1A",
+    panel="#252526",
+    dark=True,
+    variables={
+        "border": "#00FFFF80",
+        "border-blurred": "#00FFFF4D",
+        "block-cursor-foreground": "#101010",
+        "block-cursor-background": "#00FFFF",
+        "input-cursor-background": "#00FFFF",
+        "input-cursor-foreground": "#101010",
+        "input-selection-background": "#FF00FF40",
+        "scrollbar-color": "#252526",
+        "scrollbar-color-hover": "#FF00FF",
+        "scrollbar-color-active": "#CC00CC",
+        "footer-key-background": "#00FFFF",
+        "footer-key-foreground": "#101010",
+        "link-color": "#00FFFF",
+        "link-style": "underline",
+        "link-background-hover": "#00FFFF",
+        "link-color-hover": "#101010",
+        "link-style-hover": "bold not underline",
+    },
+)
 
 
 class StreamToLogger:
@@ -190,7 +227,118 @@ class ModelSelectProvider(Provider):
 class ChatApp(App):
     """A textual-based chat interface for a smolagents agent."""
 
-    CSS_PATH = "styles.css"
+    CSS = """
+    Screen {
+        background: $background;
+        color: $foreground;
+    }
+
+    #chat-history {
+        padding: 1;
+        background: $surface;
+    }
+
+    .user-message {
+        background: $panel;
+        color: $foreground;
+        padding: 1;
+        margin-bottom: 1;
+        border-left: thick $primary;
+    }
+
+    .agent-message {
+        background: $panel;
+        color: $foreground;
+        padding: 1;
+        margin-bottom: 1;
+        border-left: thick $secondary;
+        text-wrap: wrap;
+    }
+
+    .agent-thinking {
+        background: transparent;
+        color: $primary;
+        height: 1;
+        padding: 0;
+        margin-top: 1;
+        margin-bottom: 1;
+    }
+
+    .tool-call-message {
+        color: $success;
+        padding-left: 1;
+        margin-bottom: 1;
+    }
+
+    .info-message {
+        background: $panel;
+        color: $primary-muted;
+        border-left: thick $primary-muted;
+        padding: 1;
+        margin-bottom: 1;
+        text-wrap: wrap;
+    }
+
+    .error-message {
+        background: $panel;
+        color: $error;
+        padding: 1;
+        margin-bottom: 1;
+        border-left: thick $error;
+        text-wrap: wrap;
+    }
+
+    Input {
+        background: $panel;
+        color: $foreground;
+        border: tall $primary 30%;
+    }
+
+    Input:focus {
+        border: tall $primary;
+    }
+
+    #model-select-dialog {
+        background: $surface;
+        padding: 1 2;
+        border: thick $accent;
+        width: 80;
+        height: auto;
+        align: center middle;
+    }
+
+    .dialog-title {
+        align: center top;
+        width: 100%;
+        margin-bottom: 1;
+        text-style: bold;
+        color: $primary;
+    }
+
+    #model-select OptionList {
+        background: $background;
+    }
+
+    #model-select Option:hover {
+        background: $primary 20%;
+    }
+
+    #model-select Option.--highlight {
+        background: $primary;
+        color: $background;
+    }
+
+    Footer {
+        background: $panel;
+    }
+
+    Footer > .footer--key {
+        background: $footer-key-background;
+        color: $footer-key-foreground;
+        text-style: bold;
+    }
+    """
+
     BINDINGS = [
         ("up", "history_prev", "Previous command"),
         ("down", "history_next", "Next command"),
@@ -241,6 +389,7 @@ class ChatApp(App):
         )
         self.global_context_length = self.settings.get("contextLength", 8192)
         self.model_context_lengths = {}  # Initialize model_context_lengths
+        self.is_loading = False
 
     def _is_phoenix_running(self) -> bool:
         import socket
@@ -338,6 +487,10 @@ class ChatApp(App):
 
     def on_mount(self) -> None:
         """Called when the app is mounted. Sets up the agent and MCP connections."""
+        # Register and set the custom theme
+        self.register_theme(cyberpunk_theme)
+        self.theme = "cyberpunk"
+
         # provider = trace.get_tracer_provider()
         # provider.add_span_processor(SimpleSpanProcessor(self.TextualSpanExporter(self)))
 
@@ -548,6 +701,9 @@ class ChatApp(App):
 
     def on_chat_app_agent_response(self, message: AgentResponse) -> None:
         """Handles the agent's response."""
+        self.is_loading = False
+        self.query_one(Input).placeholder = "Ask the agent to do something..."
+
         chat_history = self.query_one("#chat-history")
         chat_history.query(".agent-thinking").last().remove()
         chat_history.mount(Markdown(message.response, classes="agent-message"))
@@ -644,6 +800,9 @@ class ChatApp(App):
 
     async def on_input_submitted(self, event: Input.Submitted) -> None:
         """Handles user input and displays the agent's response."""
+        if self.is_loading:
+            return
+
         user_message = event.value.strip()
 
         if not user_message:
@@ -669,7 +828,10 @@ class ChatApp(App):
             chat_history.scroll_end()
             return
 
-        chat_history.mount(Static("Thinking...", classes="agent-thinking"))
+        self.is_loading = True
+        self.query_one(Input).placeholder = "Waiting for response..."
+
+        chat_history.mount(LoadingIndicator(classes="agent-thinking"))
         chat_history.scroll_end()
 
         self.run_worker(
@@ -1081,34 +1243,6 @@ if __name__ == "__main__":
     stderr_logger = logging.getLogger("STDERR")
     sys.stderr = StreamToLogger(stderr_logger, logging.ERROR)
     print("--- VibeAgent session started, logging to vibeagent.log ---")
-
-    if not os.path.exists("styles.css"):
-        with open("styles.css", "w") as f:
-            f.write(
-                """
-            Screen { background: #1e1e1e; }
-            #chat-history { padding: 1; background: #252526; }
-            .user-message { background: #2d2d2d; color: #d4d4d4; padding: 1; margin-bottom: 1; border-left: thick #3c3c3c; }
-            .agent-message, .agent-thinking, .info-message, .error-message { background: #333333; color: #cccccc; padding: 1; margin-bottom: 1; border-left: thick #4f4f4f; text-wrap: wrap; }
-            .tool-call-message { color: #f0e68c; padding-left: 1; margin-bottom: 1; }
-            .info-message { color: #8c8c8c; }
-            .error-message { color: #ff6347; border-left: thick #ff6347;}
-            Input { background: #3c3c3c; border: none; color: #cccccc; }
-            #model-select-dialog {
-                background: #2d2d2d;
-                padding: 1 2;
-                border: thick #3c3c3c;
-                width: 80;
-                height: auto;
-                align: center middle;
-            }
-            .dialog-title {
-                align: center top;
-                width: 100%;
-                margin-bottom: 1;
-            }
-            """
-            )
 
     app = ChatApp(model_id=model_id, api_key=api_key, api_base=api_base)
     app.settings = settings  # Set the settings after instantiation
