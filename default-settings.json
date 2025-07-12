@@ -24,6 +24,12 @@
         "$HOME/ai_workspace"
       ]
     },
+    "text-editor": {
+      "command": "uvx",
+      "args": [
+        "mcp-text-editor"
+      ]
+    },
     "fetch": {
       "command": "uvx",
       "args": [
@@ -60,6 +66,12 @@
       "args": [
         "-y",
         "mcp-searxng"
+      ]
+    },
+    "pollinations": {
+      "command": "npx",
+      "args": [
+        "@pollinations/model-context-protocol"
       ]
     }
   }
