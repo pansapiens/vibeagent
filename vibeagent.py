@@ -222,7 +222,7 @@ class ChatApp(App):
         super().__init__()
         self.title = "Vibe Agent Chat"
         self.agent = None
-        self.mcp_client = None
+        self.mcp_clients = []
         self.command_history = []
         self.history_index = -1
         self.settings = {}
@@ -233,10 +233,13 @@ class ChatApp(App):
         self.available_models = []
         self.favorite_models = []
         self.all_tools = []
+        self.tools_by_source = {}  # New
         self.instrumentor = SmolagentsInstrumentor() if TELEMETRY_AVAILABLE else None
         self.telemetry_is_active = False
-        self.default_strategy = settings.get("contextManagementStrategy", "drop_oldest")
-        self.global_context_length = settings.get("contextLength", 8192)
+        self.default_strategy = self.settings.get(
+            "contextManagementStrategy", "drop_oldest"
+        )
+        self.global_context_length = self.settings.get("contextLength", 8192)
         self.model_context_lengths = {}  # Initialize model_context_lengths
 
     def _is_phoenix_running(self) -> bool:
@@ -362,9 +365,10 @@ class ChatApp(App):
 
     def on_unmount(self) -> None:
         """Called when the app is unmounted. Disconnects the MCP client."""
-        if self.mcp_client:
+        if self.mcp_clients:
             print("Disconnecting from MCP servers...")
-            self.mcp_client.disconnect()
+            for client in self.mcp_clients:
+                client.disconnect()
 
         # Close MCP server log files
         for log_file in self.mcp_log_files.values():
@@ -376,6 +380,7 @@ class ChatApp(App):
     def setup_agent_and_tools(self, settings):
         """Initializes the MCP client and the agent with all available tools."""
         local_tools = [aider_edit_file]
+        self.tools_by_source = {"inbuilt": local_tools}
         mcp_tools = []
         self.settings = settings
         server_configs = self.settings.get("mcpServers", {})
@@ -384,33 +389,7 @@ class ChatApp(App):
         logs_dir = os.path.join("logs", "mcp")
         os.makedirs(logs_dir, exist_ok=True)
 
-        server_params = []
-
-        for name, config in server_configs.items():
-            # Skip disabled servers
-            if config.get("disabled", False):
-                print(f"Skipping disabled MCP server: {name}")
-                continue
-
-            command = config.get("command")
-            args = config.get("args", [])
-            env = config.get("env", {})
-            if command:
-                full_env = {**os.environ, **env}
-
-                # Create log file for this server's stderr
-                log_file_path = os.path.join(logs_dir, f"{name}.log")
-                log_file = open(log_file_path, "w")
-
-                # Create a unique key for this server (command + args)
-                server_key = f"{command} {' '.join(args)}"
-                self.mcp_log_files[server_key] = log_file
-
-                server_params.append(
-                    StdioServerParameters(command=command, args=args, env=full_env)
-                )
-
-        if server_params:
+        if server_configs:
             try:
                 # Monkey patch stdio_client to use our custom log files
                 from mcp.client.stdio import stdio_client
@@ -442,8 +421,35 @@ class ChatApp(App):
                 except ImportError:
                     pass
 
-                self.mcp_client = MCPClient(server_params)
-                mcp_tools = self.mcp_client.get_tools()
+                for name, config in server_configs.items():
+                    # Skip disabled servers
+                    if config.get("disabled", False):
+                        print(f"Skipping disabled MCP server: {name}")
+                        continue
+
+                    command = config.get("command")
+                    args = config.get("args", [])
+                    env = config.get("env", {})
+                    if command:
+                        full_env = {**os.environ, **env}
+
+                        # Create log file for this server's stderr
+                        log_file_path = os.path.join(logs_dir, f"{name}.log")
+                        log_file = open(log_file_path, "w")
+
+                        # Create a unique key for this server (command + args)
+                        server_key = f"{command} {' '.join(args)}"
+                        self.mcp_log_files[server_key] = log_file
+
+                        server_param = StdioServerParameters(
+                            command=command, args=args, env=full_env
+                        )
+                        client = MCPClient([server_param])
+                        self.mcp_clients.append(client)
+                        server_tools = client.get_tools()
+                        self.tools_by_source[name] = server_tools
+                        mcp_tools.extend(server_tools)
+                        print(f"Found {len(server_tools)} tools from '{name}' server.")
 
                 # Restore original function
                 mcp.client.stdio.stdio_client = original_stdio_client
@@ -709,26 +715,54 @@ class ChatApp(App):
     def list_tools(self) -> None:
         """Displays the list of available tools."""
         chat_history = self.query_one("#chat-history")
-        if self.agent and hasattr(self.agent, "tools"):
-            tools_iterable = self.agent.tools
-            if isinstance(tools_iterable, dict):
-                tools_iterable = tools_iterable.values()
-
-            tool_items = ["[bold]Available tools:[/bold]"]
-            for tool in sorted(tools_iterable, key=lambda t: t.name):
-                # Guard against tools with no description
-                description = getattr(tool, "description", "No description available.")
-                first_line = description.strip().split("\n")[0]
-                tool_items.append(f"• [bold]{tool.name}[/bold]: {first_line}")
-            tool_list_str = "\n".join(tool_items)
-            chat_history.mount(Static(tool_list_str, classes="info-message"))
-        else:
+        if not self.agent or not hasattr(self.agent, "tools"):
             chat_history.mount(
                 Static(
                     "No tools available or agent not initialized.",
                     classes="error-message",
                 )
             )
+            chat_history.scroll_end()
+            return
+
+        tool_items = []
+
+        # MCP and local tools from self.tools_by_source
+        for source, tools in self.tools_by_source.items():
+            if tools:
+                tool_items.append(
+                    f"\n[bold underline]{source.capitalize()} Tools[/bold underline]"
+                )
+                sorted_tools = sorted(tools, key=lambda t: t.name)
+                for tool in sorted_tools:
+                    description = getattr(
+                        tool, "description", "No description available."
+                    )
+                    first_line = description.strip().split("\n")[0]
+                    tool_items.append(f"• [bold]{tool.name}[/bold]: {first_line}")
+
+        # Base tools
+        agent_tool_names = set(self.agent.tools.keys())
+        all_my_tool_names = {t.name for t in self.all_tools}
+        base_tool_names = agent_tool_names - all_my_tool_names
+
+        if base_tool_names:
+            tool_items.append("\n[bold underline]Base Tools[/bold underline]")
+            for tool_name in sorted(list(base_tool_names)):
+                tool = self.agent.tools[tool_name]
+                description = getattr(tool, "description", "No description available.")
+                first_line = description.strip().split("\n")[0]
+                tool_items.append(f"• [bold]{tool.name}[/bold]: {first_line}")
+
+        if not tool_items:
+            tool_list_str = "No tools available."
+        else:
+            # remove first newline if present
+            if tool_items and tool_items[0].startswith("\n"):
+                tool_items[0] = tool_items[0][1:]
+            tool_list_str = "\n".join(tool_items)
+
+        chat_history.mount(Static(tool_list_str, classes="info-message"))
         chat_history.scroll_end()
 
     def action_history_prev(self) -> None:
@@ -1055,7 +1089,7 @@ if __name__ == "__main__":
             Screen { background: #1e1e1e; }
             #chat-history { padding: 1; background: #252526; }
             .user-message { background: #2d2d2d; color: #d4d4d4; padding: 1; margin-bottom: 1; border-left: thick #3c3c3c; }
-            .agent-message, .agent-thinking, .info-message, .error-message { background: #333333; color: #cccccc; padding: 1; margin-bottom: 1; border-left: thick #4f4f4f; }
+            .agent-message, .agent-thinking, .info-message, .error-message { background: #333333; color: #cccccc; padding: 1; margin-bottom: 1; border-left: thick #4f4f4f; text-wrap: wrap; }
             .tool-call-message { color: #f0e68c; padding-left: 1; margin-bottom: 1; }
             .info-message { color: #8c8c8c; }
             .error-message { color: #ff6347; border-left: thick #ff6347;}
@@ -1069,7 +1103,7 @@ if __name__ == "__main__":
                 align: center middle;
             }
             .dialog-title {
-                content-align: center;
+                align: center top;
                 width: 100%;
                 margin-bottom: 1;
             }
