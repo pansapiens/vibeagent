@@ -20,7 +20,7 @@ import time
 from functools import partial
 from dotenv import load_dotenv
 from smolagents import ToolCallingAgent, tool, MCPClient
-from smolagents.models import OpenAIServerModel, MessageRole, ChatMessage
+from smolagents.models import OpenAIServerModel, MessageRole, ChatMessage, TokenUsage
 from smolagents.monitoring import Timing
 from mcp import StdioServerParameters
 from textual.app import App, ComposeResult
@@ -577,7 +577,14 @@ class ChatApp(App):
                 return []  # No suggestions for arguments of other commands for now
         else:
             # User is typing a command, textual-autocomplete will filter
-            commands = ["/quit", "/tools", "/model", "/refresh-models", "/compress"]
+            commands = [
+                "/quit",
+                "/tools",
+                "/model",
+                "/refresh-models",
+                "/compress",
+                "/dump-context",
+            ]
             return [DropdownItem(cmd) for cmd in commands]
 
     def on_chat_app_tool_call(self, message: ToolCall) -> None:
@@ -623,6 +630,9 @@ class ChatApp(App):
         if command == "/compress":
             strategy = arg.strip() if arg else self.default_strategy
             self.compress_context(strategy)
+            return True
+        if command == "/dump-context":
+            self.dump_context()
             return True
         return False
 
@@ -778,6 +788,37 @@ class ChatApp(App):
                 total_tokens += step.token_usage.total_tokens
         return total_tokens
 
+    def dump_context(self):
+        """Dumps the current context to the UI as JSON."""
+        if not self.agent:
+            self.query_one("#chat-history").mount(
+                Static("Agent is not initialized.", classes="error-message")
+            )
+            return
+
+        chat_history = self.query_one("#chat-history")
+        try:
+            messages = self.agent.write_memory_to_messages()
+            # Convert messages to a list of dictionaries for JSON serialization
+            messages_as_dicts = [m.dict() for m in messages]
+            # clean up raw field
+            for m in messages_as_dicts:
+                if "raw" in m:
+                    del m["raw"]
+
+            json_context = json.dumps(messages_as_dicts, indent=2)
+
+            # Create a Markdown block for the JSON
+            markdown_content = f"```json\n{json_context}\n```"
+            chat_history.mount(Markdown(markdown_content, classes="info-message"))
+
+        except Exception as e:
+            chat_history.mount(
+                Static(f"Error dumping context: {e}", classes="error-message")
+            )
+        finally:
+            chat_history.scroll_end()
+
     def compress_context(self, strategy: str):
         if not self.agent:
             self.query_one("#chat-history").mount(
@@ -835,11 +876,37 @@ class ChatApp(App):
                     for m in messages
                 ]
             )
-            summary_prompt = f"Summarize the following conversation history concisely while retaining key information:\n\n{history_text}"
-            summary_message = self.agent.model.generate(
-                [ChatMessage(role=MessageRole.USER, content=summary_prompt)]
+            summary_prompt = f"""
+            Summarize the following conversation history concisely while retaining key information. 
+            DON'T summarize the tools available, but do include a summary of the tools used. 
+            ALWAYS include the actual content of the final answer.
+            If the user has been generating code or files, include the final version of the code 
+            or final file path(s):\n\n{history_text}
+            """.strip()
+
+            # Create a dedicated summarization agent
+            summarizer_model = OpenAIServerModel(
+                model_id=self.model_id,
+                api_key=self.api_key,
+                api_base=self.api_base,
             )
-            summary = summary_message.content
+            summarizer_agent = ToolCallingAgent(
+                model=summarizer_model,
+                tools=[],  # No special tools for now
+                add_base_tools=True,  # Needs final_answer tool
+            )
+
+            # Run the summarizer agent to get the summary
+            summary = summarizer_agent.run(summary_prompt)
+
+            # Get the token usage from the summarizer agent's last step
+            summarizer_token_usage = None
+            if summarizer_agent.memory.steps:
+                last_step = summarizer_agent.memory.steps[-1]
+                if hasattr(last_step, "token_usage") and last_step.token_usage:
+                    summarizer_token_usage = last_step.token_usage
+
+            # Create a simple summary step to replace the history
             timing = Timing(start_time=time.time())
             timing.end_time = time.time()
             summary_step = ActionStep(
@@ -847,8 +914,13 @@ class ChatApp(App):
                 timing=timing,
                 model_output="Conversation summary:",
                 observations=summary,
-                token_usage=summary_message.token_usage,
+                token_usage=summarizer_token_usage
+                or TokenUsage(
+                    input_tokens=0, output_tokens=0
+                ),  # Use summarizer's token usage or fallback
             )
+
+            # Replace the agent's memory with just the summary
             self.agent.memory.steps = [summary_step]
             self.agent.step_number = 2
 
