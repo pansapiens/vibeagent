@@ -7,6 +7,7 @@
 #   "aider-chat",
 #   "openai",
 #   "textual-autocomplete",
+#   "platformdirs",
 # ]
 # ///
 
@@ -20,8 +21,10 @@ import time
 import random
 import string
 from functools import partial
+from pathlib import Path
 from dotenv import load_dotenv
 from contextlib import redirect_stdout
+import platformdirs
 from smolagents import ToolCallingAgent, tool, MCPClient
 from smolagents.models import OpenAIServerModel, MessageRole, ChatMessage, TokenUsage
 from smolagents.monitoring import Timing
@@ -492,6 +495,8 @@ class ChatApp(App):
         self,
         model_config: dict,
         initial_model_id: str,
+        config_dir: Path,
+        log_dir: Path,
     ):
         super().__init__()
         self.title = "Vibe Agent Chat"
@@ -519,6 +524,8 @@ class ChatApp(App):
         self.agent_worker = None
         self.glitch_mode = False
         self.glitch_strength = 0.10
+        self.config_dir = config_dir
+        self.log_dir = log_dir
 
     def _is_phoenix_running(self) -> bool:
         import socket
@@ -769,8 +776,8 @@ class ChatApp(App):
         server_configs = self.settings.get("mcpServers", {})
 
         # Create logs directory structure
-        logs_dir = os.path.join("logs", "mcp")
-        os.makedirs(logs_dir, exist_ok=True)
+        mcp_log_dir = self.log_dir / "mcp"
+        mcp_log_dir.mkdir(exist_ok=True)
 
         if server_configs:
             try:
@@ -817,7 +824,7 @@ class ChatApp(App):
                         full_env = {**os.environ, **env}
 
                         # Create log file for this server's stderr
-                        log_file_path = os.path.join(logs_dir, f"{name}.log")
+                        log_file_path = mcp_log_dir / f"{name}.log"
                         log_file = open(log_file_path, "w")
 
                         # Create a unique key for this server (command + args)
@@ -1000,6 +1007,7 @@ class ChatApp(App):
                 "/refresh-models",
                 "/compress",
                 "/dump-context",
+                "/show-settings",
             ]
             return [DropdownItem(cmd) for cmd in commands]
 
@@ -1076,6 +1084,9 @@ class ChatApp(App):
             return True
         if command == "/dump-context":
             self.dump_context()
+            return True
+        if command == "/show-settings":
+            self.show_settings()
             return True
         return False
 
@@ -1319,6 +1330,34 @@ class ChatApp(App):
         finally:
             chat_history.scroll_end()
 
+    def show_settings(self):
+        """Displays configuration and log paths, and settings content."""
+        chat_history = self.query_one("#chat-history")
+        try:
+            settings_path = self.config_dir / "settings.json"
+            if settings_path.exists():
+                with open(settings_path, "r") as f:
+                    settings_content = json.load(f)
+                settings_dump = json.dumps(settings_content, indent=2)
+            else:
+                settings_dump = "settings.json not found."
+
+            info_text = (
+                f"**Config Path:** {self.config_dir}\n\n"
+                f"**Logs Path:**   {self.log_dir}\n\n"
+                f"**settings.json:**\n\n"
+                f"```json\n{settings_dump}\n```"
+            )
+
+            chat_history.mount(Markdown(info_text, classes="info-message"))
+
+        except Exception as e:
+            chat_history.mount(
+                Static(f"Error showing settings: {e}", classes="error-message")
+            )
+        finally:
+            chat_history.scroll_end()
+
     def compress_context(self, strategy: str):
         if not self.agent:
             self.query_one("#chat-history").mount(
@@ -1504,31 +1543,40 @@ if __name__ == "__main__":
     # --api-key-env-var and --api-base are removed as they are now endpoint-specific
     args = parser.parse_args()
 
+    APP_NAME = "vibeagent"
+    config_dir = Path(platformdirs.user_config_dir(APP_NAME))
+    log_dir = Path(platformdirs.user_log_dir(APP_NAME))
+    config_dir.mkdir(parents=True, exist_ok=True)
+    log_dir.mkdir(parents=True, exist_ok=True)
+
     # Load settings to get model configuration
-    def load_settings():
+    def load_settings(config_dir: Path):
         """Load settings from settings.json with environment variable substitution."""
-        if not os.path.exists("settings.json"):
-            print("settings.json not found, creating from default-settings.json...")
+        settings_path = config_dir / "settings.json"
+        if not settings_path.exists():
+            print(
+                f"settings.json not found in {config_dir}, creating from default-settings.json..."
+            )
             if os.path.exists("default-settings.json"):
                 try:
                     import shutil
 
-                    shutil.copyfile("default-settings.json", "settings.json")
+                    shutil.copyfile("default-settings.json", settings_path)
                 except IOError as e:
                     print(
                         f"Error copying from default-settings.json: {e}. Creating empty settings file."
                     )
-                    with open("settings.json", "w") as f_settings:
+                    with open(settings_path, "w") as f_settings:
                         json.dump({"mcpServers": {}}, f_settings, indent=2)
             else:
                 print(
                     "Warning: default-settings.json not found. Creating empty settings.json."
                 )
-                with open("settings.json", "w") as f_settings:
+                with open(settings_path, "w") as f_settings:
                     json.dump({"mcpServers": {}}, f_settings, indent=2)
 
         try:
-            with open("settings.json", "r") as f:
+            with open(settings_path, "r") as f:
                 config = json.load(f)
 
                 def _substitute_env_vars(data):
@@ -1554,7 +1602,7 @@ if __name__ == "__main__":
             return {}
 
     # Load settings and determine model configuration
-    settings = load_settings()
+    settings = load_settings(config_dir)
     model_config = settings
 
     # Determine the initial model to use
@@ -1573,7 +1621,7 @@ if __name__ == "__main__":
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        filename="logs/vibeagent.log",
+        filename=log_dir / "vibeagent.log",
         filemode="w",
     )
     stdout_logger = logging.getLogger("STDOUT")
@@ -1582,6 +1630,11 @@ if __name__ == "__main__":
     sys.stderr = StreamToLogger(stderr_logger, logging.ERROR)
     print("--- VibeAgent session started, logging to vibeagent.log ---")
 
-    app = ChatApp(model_config=model_config, initial_model_id=initial_model_id)
+    app = ChatApp(
+        model_config=model_config,
+        initial_model_id=initial_model_id,
+        config_dir=config_dir,
+        log_dir=log_dir,
+    )
     app.settings = settings  # Set the settings after instantiation
     app.run()
