@@ -1132,7 +1132,7 @@ class ChatApp(App):
             self.compress_context(strategy)
             return True
         if command == "/dump-context":
-            self.dump_context()
+            self.dump_context(arg.strip() if arg else "markdown")
             return True
         if command == "/show-settings":
             self.show_settings()
@@ -1348,8 +1348,48 @@ class ChatApp(App):
                 total_tokens += step.token_usage.total_tokens
         return total_tokens
 
-    def dump_context(self):
-        """Dumps the current context to the UI as JSON."""
+    def _format_context_as_markdown(self, messages: list[dict]) -> str:
+        """Formats the agent's message history into a readable markdown string."""
+        markdown_lines = []
+        for msg in messages:
+            role = msg.get("role", "unknown")
+            markdown_lines.append(f"### {role.replace('_', ' ').title()}")
+            content = msg.get("content")
+            if isinstance(content, list):
+                for part in content:
+                    if part.get("type") == "text":
+                        text_content = part.get("text", "")
+                        markdown_lines.append(text_content)
+                    elif part.get("type") == "image":
+                        markdown_lines.append("*[Image Content]*")
+            elif isinstance(content, str):
+                markdown_lines.append(content)
+            tool_calls = msg.get("tool_calls")
+            if tool_calls:
+                markdown_lines.append("\n**Tool Calls:**")
+                for tc in tool_calls:
+                    function = tc.get("function", {})
+                    name = function.get("name", "N/A")
+                    arguments = function.get("arguments", "{}")
+                    markdown_lines.append(f"- **{name}**")
+                    try:
+                        args_dict = (
+                            json.loads(arguments)
+                            if isinstance(arguments, str)
+                            else arguments
+                        )
+                        pretty_args = json.dumps(args_dict, indent=2)
+                        markdown_lines.append(f"  ```json\n{pretty_args}\n  ```")
+                    except (json.JSONDecodeError, TypeError):
+                        markdown_lines.append(f"  Arguments: `{arguments}`")
+            token_usage = msg.get("token_usage")
+            if token_usage and token_usage.get("total_tokens", 0) > 0:
+                markdown_lines.append(f"\n*Tokens: {token_usage.get('total_tokens')}*")
+            markdown_lines.append("\n---")
+        return "\n".join(markdown_lines)
+
+    def dump_context(self, output_format: str = "markdown"):
+        """Dumps the current context to the UI."""
         if not self.agent:
             self.query_one("#chat-history").mount(
                 Static("Agent is not initialized.", classes="error-message")
@@ -1359,17 +1399,17 @@ class ChatApp(App):
         chat_history = self.query_one("#chat-history")
         try:
             messages = self.agent.write_memory_to_messages()
-            # Convert messages to a list of dictionaries for JSON serialization
             messages_as_dicts = [m.dict() for m in messages]
-            # clean up raw field
             for m in messages_as_dicts:
                 if "raw" in m:
                     del m["raw"]
 
-            json_context = json.dumps(messages_as_dicts, indent=2)
+            if output_format == "json":
+                json_context = json.dumps(messages_as_dicts, indent=2)
+                markdown_content = f"```json\n{json_context}\n```"
+            else:
+                markdown_content = self._format_context_as_markdown(messages_as_dicts)
 
-            # Create a Markdown block for the JSON
-            markdown_content = f"```json\n{json_context}\n```"
             chat_history.mount(Markdown(markdown_content, classes="info-message"))
 
         except Exception as e:
