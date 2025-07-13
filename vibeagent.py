@@ -926,7 +926,7 @@ class ChatApp(App):
             add_base_tools=True,
         )
 
-        self.query_one(Header).title = f"Vibe Agent ({self.model_id})"
+        self.query_one(Header).title = f"vibeagent ({self.model_id})"
 
         if not startup:
             chat_history = self.query_one("#chat-history")

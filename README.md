@@ -1,5 +1,14 @@
 # vibeagent
 
+A terminal friendly LLM chat interface.
+
+Features:
+
+- MCP tool support
+- Multiple OpenAI-compatible API endpoints (openrouter, and your local ollama/llama-swap)
+- Context management
+- Monitoring and telemetry via arize-phoenix, in-app context dump
+
 ##  Running
 
 ```bash
