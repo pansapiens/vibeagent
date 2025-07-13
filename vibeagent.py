@@ -617,7 +617,7 @@ class ChatApp(App):
         model_id_counts = {}
 
         for provider_name, config in endpoints.items():
-            if not config.get("enabled", False):
+            if not config.get("enabled", True):
                 continue
             try:
                 api_key = config.get("api_key")
