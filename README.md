@@ -13,6 +13,10 @@ Ask the agent to do something filesystem or search related.
 - `/tools` - List available tools
 - `/quit` - Quit the agent
 - `/model [name]` - Change the model. If `[name]` is omitted, a selection dialog is shown.
+- `/refresh-models` - Fetches the latest list of available models from configured endpoints.
+- `/compress [strategy]` - Manually compress the conversation history to save tokens. Strategies: `drop_oldest`, `middle_out`, `summarize`.
+- `/dump-context [format]` - Display the agent's current memory. Format can be `markdown` (default) or `json`.
+- `/show-settings` - Displays the location of configuration files and their current content.
 
 ### Command Line Options
 
@@ -36,6 +40,20 @@ Edit `.env` to your liking.
 
 After first run, a `settings.json` will be generated. You can edit this to add or remove MCP servers and configure the model.
 
+### File Locations
+
+`vibeagent` stores its files in standard user locations on your operating system:
+
+- **Configuration**: `settings.json` is located in:
+  - **Linux**: `~/.config/vibeagent/settings.json`
+  - **macOS**: `~/Library/Application Support/vibeagent/settings.json` ?
+  - **Windows**: `C:\Users\<user>\AppData\Local\vibeagent\vibeagent\settings.json` ?
+
+- **Logs**: Log files are stored in:
+  - **Linux**: `~/.local/state/vibeagent/log/`
+  - **macOS**: `~/Library/Logs/vibeagent/` ?
+  - **Windows**: `C:\Users\<user>\AppData\Local\vibeagent\vibeagent\Logs\` ?
+
 ### Model Configuration
 
 The model can be configured in multiple ways with the following priority (highest to lowest):
@@ -48,11 +66,19 @@ The model can be configured in multiple ways with the following priority (highes
 
 ```json
 {
-  "model": {
-    "id": "mistralai/devstral-small:free",
-    "api_key": "$OPENROUTER_API_KEY",
-    "api_base": "https://openrouter.ai/api/v1"
+  "endpoints": {
+    "openrouter": {
+      "api_key": "$OPENROUTER_API_KEY",
+      "api_base": "https://openrouter.ai/api/v1",
+      "enabled": true
+    },
+    "ollama": {
+      "api_key": "ollama",
+      "api_base": "http://localhost:11434/v1",
+      "enabled": false
+    }
   },
+  "defaultModel": "mistralai/devstral-small:free",
   "favoriteModels": [
     "mistralai/devstral-small:free",
     "google/gemma-3n-e4b-it"
@@ -60,10 +86,12 @@ The model can be configured in multiple ways with the following priority (highes
 }
 ```
 
-- `id`: The model identifier (e.g., "mistralai/devstral-small:free", "google/gemma-3n-e4b-it")
-- `api_key`: Your API key (can use environment variable substitution with `$VAR_NAME`)
-- `api_base`: The API base URL (defaults to OpenRouter)
-- `favoriteModels`: A list of model IDs to show at the top of the model selection list.
+- `endpoints`: A dictionary of API providers. The agent will fetch available models from all `enabled` endpoints.
+  - `api_key`: Your API key for the service (can use environment variable substitution with `$VAR_NAME`).
+  - `api_base`: The API base URL for the service.
+  - `enabled`: Set to `true` to use this endpoint. This is optional and defaults to `true`.
+- `defaultModel`: The model identifier to use on startup.
+- `favoriteModels`: A list of model IDs to show at the top of the `/model` selection list.
 
 ##  Monitoring the agent, telemetry
 
