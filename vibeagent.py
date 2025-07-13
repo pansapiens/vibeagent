@@ -46,6 +46,7 @@ from textual.screen import ModalScreen
 from textual.theme import Theme
 from textual.command import Provider, Hit, Hits
 from textual.binding import Binding
+from textual.worker import Worker, WorkerState
 from textual_autocomplete import AutoComplete, DropdownItem
 from textual_autocomplete._autocomplete import TargetState
 from smolagents.memory import ActionStep, MemoryStep
@@ -229,6 +230,7 @@ class ChatApp(App):
         margin-bottom: 1;
         border-left: thick $secondary;
         text-wrap: wrap;
+        text-overflow: fold;
     }
 
     .agent-thinking {
@@ -253,6 +255,7 @@ class ChatApp(App):
         padding: 1;
         margin-bottom: 1;
         text-wrap: wrap;
+        text-overflow: fold;
     }
 
     .error-message {
@@ -262,6 +265,7 @@ class ChatApp(App):
         margin-bottom: 1;
         border-left: thick $error;
         text-wrap: wrap;
+        text-overflow: fold;
     }
 
     Input {
@@ -681,8 +685,8 @@ class ChatApp(App):
 
         # provider = trace.get_tracer_provider()
         # provider.add_span_processor(SimpleSpanProcessor(self.TextualSpanExporter(self)))
-
-        self.query_one("#chat-history").mount(
+        chat_history = self.query_one("#chat-history")
+        chat_history.mount(
             Static(
                 "Initializing agent and connecting to tool servers...",
                 classes="info-message",
@@ -691,18 +695,15 @@ class ChatApp(App):
         self.favorite_models = self.settings.get("favoriteModels", [])
         self.run_worker(self.fetch_models, thread=True)
 
-        self.setup_agent_and_tools(self.settings)
-
-        # Log the model name during initialization
-        logging.info(f"Model initialized: {self.model_id}")
-
-        self.query_one("#chat-history").mount(
-            Static(
-                f"Agent is ready. Model: {self.model_id}. Type your message and press Enter.",
-                classes="info-message",
-            )
+        self.is_loading = True
+        self.query_one(Input).placeholder = "Initializing agent..."
+        self.run_worker(
+            partial(self.setup_agent_and_tools, self.settings),
+            name="setup_agent",
+            thread=True,
         )
-        self.query_one("#input").focus(scroll_visible=True)
+        chat_history.mount(LoadingIndicator(classes="agent-thinking"))
+        chat_history.scroll_end()
 
     def on_unmount(self) -> None:
         """Called when the app is unmounted. Disconnects the MCP client."""
@@ -720,6 +721,7 @@ class ChatApp(App):
 
     def setup_agent_and_tools(self, settings):
         """Initializes the MCP client and the agent with all available tools."""
+        logging.info("Starting agent and tool setup...")
 
         class CaptureIO(io.StringIO):
             encoding = "utf-8"
@@ -774,6 +776,7 @@ class ChatApp(App):
         mcp_tools = []
         self.settings = settings
         server_configs = self.settings.get("mcpServers", {})
+        logging.info(f"Found {len(server_configs)} MCP server configurations.")
 
         # Create logs directory structure
         mcp_log_dir = self.log_dir / "mcp"
@@ -812,9 +815,10 @@ class ChatApp(App):
                     pass
 
                 for name, config in server_configs.items():
+                    logging.info(f"Processing MCP server config: {name}")
                     # Skip disabled servers
                     if config.get("disabled", False):
-                        print(f"Skipping disabled MCP server: {name}")
+                        logging.info(f"Skipping disabled MCP server: {name}")
                         continue
 
                     command = config.get("command")
@@ -831,22 +835,27 @@ class ChatApp(App):
                         server_key = f"{command} {' '.join(args)}"
                         self.mcp_log_files[server_key] = log_file
 
+                        logging.info(f"[{name}] Creating StdioServerParameters...")
                         server_param = StdioServerParameters(
                             command=command, args=args, env=full_env
                         )
+                        logging.info(f"[{name}] Creating MCPClient...")
                         client = MCPClient([server_param])
                         self.mcp_clients.append(client)
+
+                        logging.info(f"[{name}] Getting tools from server...")
                         server_tools = client.get_tools()
+                        logging.info(f"[{name}] Found {len(server_tools)} tools.")
+
                         self.tools_by_source[name] = server_tools
                         mcp_tools.extend(server_tools)
-                        print(f"Found {len(server_tools)} tools from '{name}' server.")
 
                 # Restore original function
                 mcp.client.stdio.stdio_client = original_stdio_client
                 if "mcpadapt.core" in sys.modules:
                     mcpadapt.core.stdio_client = original_stdio_client
 
-                print(
+                logging.info(
                     f"Successfully connected to {len(mcp_tools)} tools from MCP servers."
                 )
             except Exception as e:
@@ -858,10 +867,11 @@ class ChatApp(App):
                 except:
                     pass
 
-                self.query_one("#chat-history").mount(
+                self.call_from_thread(
+                    self.query_one("#chat-history").mount,
                     Static(
                         f"Error connecting to MCP servers: {e}", classes="error-message"
-                    )
+                    ),
                 )
 
                 # Close log files on error
@@ -873,8 +883,11 @@ class ChatApp(App):
                 self.mcp_log_files.clear()
 
         self.all_tools = local_tools + mcp_tools
+        logging.info(f"Total tools initialized: {len(self.all_tools)}")
 
+        logging.info("Updating agent with new model...")
         self.update_agent_with_new_model(self.model_id, startup=True)
+        logging.info("Agent and tool setup complete.")
 
     def update_agent_with_new_model(self, model_id: str, startup: bool = False):
         """Creates a new agent with the specified model."""
@@ -921,6 +934,42 @@ class ChatApp(App):
                 Static(f"Switched to model: {self.model_id}", classes="info-message")
             )
             logging.info(f"Model switched to: {self.model_id}")
+
+    async def on_worker_state_changed(self, event: Worker.StateChanged) -> None:
+        """Called when a worker's state changes."""
+        if event.worker.name == "setup_agent":
+            # Remove the loading indicator when the setup worker finishes
+            if event.worker.state == WorkerState.SUCCESS:
+                # The worker is done, update the UI.
+                self.is_loading = False
+                logging.info(f"Model initialized: {self.model_id}")
+                self.query_one("#chat-history").mount(
+                    Static(
+                        f"Agent is ready. Model: {self.model_id}. Type your message and press Enter.",
+                        classes="info-message",
+                    )
+                )
+                try:
+                    self.query_one(".agent-thinking").remove()
+                except Exception:
+                    pass  # It might have already been removed
+                self.query_one(Input).placeholder = "Ask the agent to do something..."
+                self.query_one("#input").focus(scroll_visible=True)
+            elif event.worker.state == WorkerState.ERROR:
+                # The worker failed
+                self.is_loading = False
+                logging.error(f"Agent setup failed: {event.worker.error}")
+                self.query_one("#chat-history").mount(
+                    Static(
+                        "Agent initialization failed. Check logs.",
+                        classes="error-message",
+                    )
+                )
+                try:
+                    self.query_one(".agent-thinking").remove()
+                except Exception:
+                    pass  # It might have already been removed
+                self.query_one(Input).placeholder = "Agent failed to initialize."
 
     def compose(self) -> ComposeResult:
         """Creates the layout for the chat application."""
