@@ -1621,6 +1621,76 @@ class ChatApp(App):
         return "".join(glitched_chars)
 
 
+# Embedded default settings
+DEFAULT_SETTINGS = {
+    "endpoints": {
+        "openrouter": {
+            "api_key": "$OPENROUTER_API_KEY",
+            "api_base": "https://openrouter.ai/api/v1",
+            "enabled": True,
+        },
+        "local-server": {
+            "api_key": "not-needed",
+            "api_base": "http://localhost:8080/v1",
+            "enabled": False,
+        },
+        "ollama": {
+            "api_key": "ollama",
+            "api_base": "http://localhost:11434/v1",
+            "enabled": False,
+        },
+        "pollinations": {
+            "api_key": "",
+            "api_base": "https://text.pollinations.ai/openai",
+            "enabled": False,
+        },
+    },
+    "defaultModel": "mistralai/devstral-small:free",
+    "contextLength": 16384,
+    "contextManagementStrategy": "summarize",
+    "favoriteModels": [
+        "mistralai/devstral-small:free",
+        "mistralai/devstral-small",
+        "mistralai/mistral-small-3.2-24b-instruct-2506:free",
+        "google/gemma-3n-e4b-it",
+    ],
+    "allowedPaths": ["$HOME/ai_workspace"],
+    "mcpServers": {
+        "filesystem": {
+            "command": "npx",
+            "args": [
+                "-y",
+                "@modelcontextprotocol/server-filesystem",
+                "$HOME/ai_workspace",
+            ],
+        },
+        "shell": {
+            "command": "uvx",
+            "args": ["mcp-shell-server"],
+            "env": {"ALLOW_COMMANDS": "ls,cat,pwd,grep,wc,touch,find,jq"},
+        },
+        "text-editor": {"command": "uvx", "args": ["mcp-text-editor"]},
+        "fetch": {"command": "uvx", "args": ["mcp-server-fetch"]},
+        "playwright": {
+            "command": "npx",
+            "args": ["@executeautomation/playwright-mcp-server"],
+            "disabled": False,
+            "autoApprove": [],
+        },
+        "wcgw": {
+            "command": "uv",
+            "args": ["tool", "run", "--python", "3.12", "wcgw@latest"],
+        },
+        "pubmed": {"command": "uvx", "args": ["--quiet", "pubmedmcp@latest"]},
+        "searxng": {"command": "npx", "args": ["-y", "mcp-searxng"]},
+        "pollinations": {
+            "command": "npx",
+            "args": ["@pollinations/model-context-protocol"],
+        },
+    },
+}
+
+
 if __name__ == "__main__":
     # Parse command line arguments
     parser = argparse.ArgumentParser(
@@ -1644,22 +1714,14 @@ if __name__ == "__main__":
         settings_path = config_dir / "settings.json"
         if not settings_path.exists():
             print(
-                f"settings.json not found in {config_dir}, creating from default-settings.json..."
+                f"settings.json not found in {config_dir}, creating from embedded DEFAULT_SETTINGS..."
             )
-            if os.path.exists("default-settings.json"):
-                try:
-                    import shutil
-
-                    shutil.copyfile("default-settings.json", settings_path)
-                except IOError as e:
-                    print(
-                        f"Error copying from default-settings.json: {e}. Creating empty settings file."
-                    )
-                    with open(settings_path, "w") as f_settings:
-                        json.dump({"mcpServers": {}}, f_settings, indent=2)
-            else:
+            try:
+                with open(settings_path, "w") as f_settings:
+                    json.dump(DEFAULT_SETTINGS, f_settings, indent=2)
+            except IOError as e:
                 print(
-                    "Warning: default-settings.json not found. Creating empty settings.json."
+                    f"Error writing settings.json: {e}. Creating empty settings file."
                 )
                 with open(settings_path, "w") as f_settings:
                     json.dump({"mcpServers": {}}, f_settings, indent=2)
