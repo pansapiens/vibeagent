@@ -1,0 +1,22 @@
+[project]
+name = "vibeagent"
+version = "0.1.0"
+description = "A smolagents-based chat interface."
+authors = [{ name = "Andrew Perry", email = "ajperry@pansapiens.com" }]
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "smolagents[litellm,mcp,telemetry,toolkit]",
+    "textual",
+    "python-dotenv",
+    "aider-chat",
+    "openai",
+    "textual-autocomplete",
+    "platformdirs",
+]
+
+[project.scripts]
+vibeagent = "vibeagent:main"
+
+[tool.setuptools]
+py-modules = ["vibeagent"]

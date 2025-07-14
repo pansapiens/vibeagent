@@ -9,13 +9,26 @@ Features:
 - Context management
 - Monitoring and telemetry via arize-phoenix, in-app context dump
 
-##  Running
+> NOTE WELL: The default configuration has access to your filesystem and has the ability to cause data loss and maybe worse. You have been warned.
+
+##  Quickstart
+
+If you have [uv](https://docs.astral.sh/uv/) installed:
 
 ```bash
-uv run vibeagent.py
+uvx --from git+https://github.com/pansapiens/vibeagent vibeagent
 ```
 
-Ask the agent to do something filesystem or search related.
+## Installing
+
+If you've like to install it so you have the `vibeagent` command available:
+
+```bash
+pip install git+https://github.com/pansapiens/vibeagent
+
+# Then run:
+vibeagent
+```
 
 ### Commands
 

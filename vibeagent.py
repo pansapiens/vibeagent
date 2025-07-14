@@ -1691,7 +1691,7 @@ DEFAULT_SETTINGS = {
 }
 
 
-if __name__ == "__main__":
+def main():
     # Parse command line arguments
     parser = argparse.ArgumentParser(
         description="VibeAgent - A smolagents-based chat interface"
@@ -1789,3 +1789,7 @@ if __name__ == "__main__":
     )
     app.settings = settings  # Set the settings after instantiation
     app.run()
+
+
+if __name__ == "__main__":
+    main()
