@@ -20,6 +20,7 @@ import argparse
 import time
 import random
 import string
+import datetime
 from functools import partial
 from pathlib import Path
 from dotenv import load_dotenv
@@ -49,7 +50,7 @@ from textual.binding import Binding
 from textual.worker import Worker, WorkerState
 from textual_autocomplete import AutoComplete, DropdownItem
 from textual_autocomplete._autocomplete import TargetState
-from smolagents.memory import ActionStep, MemoryStep
+from smolagents.memory import ActionStep, MemoryStep, TaskStep
 
 
 try:
@@ -120,6 +121,22 @@ class StreamToLogger:
 
 # Load environment variables from .env file
 load_dotenv()
+
+
+try:
+    from openai.types.chat.chat_completion import ChatCompletion
+except ImportError:
+    ChatCompletion = None  # type: ignore
+
+
+# Custom JSON encoder to handle non-serializable objects from smolagents
+class VibeAgentJSONEncoder(json.JSONEncoder):
+    def default(self, o):
+        if isinstance(o, ChatMessage):
+            return o.dict()
+        if ChatCompletion and isinstance(o, ChatCompletion):
+            return o.model_dump()
+        return super().default(o)
 
 
 class ModelSelectScreen(ModalScreen[str]):
@@ -199,6 +216,12 @@ class ModelSelectProvider(Provider):
                 self.app.action_select_model,
                 help="Choose a different LLM to chat with.",
             )
+
+
+class SessionOperationError(Exception):
+    """Exception raised when session operations fail."""
+
+    pass
 
 
 class ChatApp(App):
@@ -501,6 +524,7 @@ class ChatApp(App):
         initial_model_id: str,
         config_dir: Path,
         log_dir: Path,
+        data_dir: Path,
     ):
         super().__init__()
         self.title = "Vibe Agent Chat"
@@ -530,6 +554,9 @@ class ChatApp(App):
         self.glitch_strength = 0.10
         self.config_dir = config_dir
         self.log_dir = log_dir
+        self.data_dir = data_dir
+        self.sessions_dir = self.data_dir / "sessions"
+        self.sessions_dir.mkdir(parents=True, exist_ok=True)
 
     def _is_phoenix_running(self) -> bool:
         import socket
@@ -597,6 +624,241 @@ class ChatApp(App):
                 logging.info("Telemetry disabled.")
             except Exception as e:
                 logging.error(f"Failed to disable telemetry: {e}")
+
+    def _get_session_path(self, name: str | None) -> Path:
+        """Resolves a session name or path into a full Path object."""
+        if name and name.endswith(".json"):
+            # Treat as a relative or absolute path
+            return Path(name)
+
+        session_name = name if name is not None else "_default"
+        return self.sessions_dir / f"{session_name}.json"
+
+    def _show_session_message(
+        self, message: str, is_error: bool = False, from_thread: bool = False
+    ):
+        """Helper to display session-related messages in the UI."""
+        message_class = "error-message" if is_error else "info-message"
+        widget = Static(message, classes=message_class)
+
+        if from_thread:
+            self.call_from_thread(self.query_one("#chat-history").mount, widget)
+            self.call_from_thread(self.query_one("#chat-history").scroll_end)
+        else:
+            self.query_one("#chat-history").mount(widget)
+            self.query_one("#chat-history").scroll_end()
+
+    def _validate_session_file(
+        self, path: Path, operation: str, from_thread: bool = False
+    ) -> bool:
+        """Validates session file existence for operations that need it."""
+        if not path.exists():
+            self._show_session_message(
+                f"Session file not found: {path}",
+                is_error=True,
+                from_thread=from_thread,
+            )
+            return False
+        return True
+
+    def _capture_ui_history(self) -> list[dict]:
+        """Captures the current UI chat history."""
+        ui_history = []
+        chat_history_widget = self.query_one("#chat-history")
+
+        for child in chat_history_widget.children:
+            if "user-message" in child.classes and isinstance(child, Static):
+                # Strip the leading "> "
+                content = str(child.renderable).split("> ", 1)[-1]
+                ui_history.append({"role": "user", "content": content})
+            elif "agent-message" in child.classes and isinstance(child, Markdown):
+                ui_history.append({"role": "agent", "content": child._markdown})
+
+        return ui_history
+
+    def _capture_agent_memory(self) -> list[dict]:
+        """Captures the current agent memory state."""
+        if not self.agent:
+            return []
+        return [step.dict() for step in self.agent.memory.steps]
+
+    def _reconstruct_agent_memory(self, agent_memory_steps: list[dict]) -> None:
+        """Reconstructs agent memory from saved session data."""
+        if not self.agent:
+            return
+
+        from smolagents.memory import ActionStep, PlanningStep, TaskStep, ToolCall
+        from smolagents.models import ChatMessage, TokenUsage
+        from smolagents.monitoring import Timing
+
+        loaded_steps = []
+        for step_dict in agent_memory_steps:
+            # Reconstruct complex nested objects from their dicts
+            if "timing" in step_dict and step_dict["timing"]:
+                timing_data = step_dict["timing"]
+                if "duration" in timing_data:
+                    del timing_data[
+                        "duration"
+                    ]  # Don't pass calculated property to constructor
+                step_dict["timing"] = Timing(**timing_data)
+
+            if "token_usage" in step_dict and step_dict["token_usage"]:
+                token_usage_data = step_dict["token_usage"]
+                if "total_tokens" in token_usage_data:
+                    del token_usage_data["total_tokens"]
+                step_dict["token_usage"] = TokenUsage(**token_usage_data)
+
+            if "tool_calls" in step_dict and step_dict["tool_calls"]:
+                reconstructed_calls = []
+                for tc_dict in step_dict["tool_calls"]:
+                    func_data = tc_dict.get("function", {})
+                    reconstructed_calls.append(
+                        ToolCall(
+                            id=tc_dict.get("id"),
+                            name=func_data.get("name"),
+                            arguments=func_data.get("arguments"),
+                        )
+                    )
+                step_dict["tool_calls"] = reconstructed_calls
+
+            if (
+                "model_input_messages" in step_dict
+                and step_dict["model_input_messages"]
+            ):
+                step_dict["model_input_messages"] = [
+                    ChatMessage.from_dict(m) for m in step_dict["model_input_messages"]
+                ]
+
+            if (
+                "model_output_message" in step_dict
+                and step_dict["model_output_message"]
+            ):
+                step_dict["model_output_message"] = ChatMessage.from_dict(
+                    step_dict["model_output_message"]
+                )
+
+            # Remove fields that can't be easily serialized/deserialized
+            step_dict.pop("error", None)
+            step_dict.pop("observations_images", None)
+            step_dict.pop("task_images", None)
+
+            # Differentiate step type based on unique keys
+            if "step_number" in step_dict:
+                loaded_steps.append(ActionStep(**step_dict))
+            elif "plan" in step_dict:
+                loaded_steps.append(PlanningStep(**step_dict))
+            elif "task" in step_dict:
+                loaded_steps.append(TaskStep(**step_dict))
+
+        self.agent.memory.steps = loaded_steps
+        action_step_count = sum(
+            1 for step in loaded_steps if isinstance(step, ActionStep)
+        )
+        self.agent.step_number = action_step_count + 1
+
+    def _restore_ui_history(self, ui_history: list[dict]) -> None:
+        """Restores UI chat history from session data."""
+        chat_history_widget = self.query_one("#chat-history")
+        self.call_from_thread(chat_history_widget.remove_children)
+
+        for message in ui_history:
+            role = message.get("role")
+            content = message.get("content", "")
+            if role == "user":
+                self.call_from_thread(
+                    chat_history_widget.mount,
+                    Static(f"> {content}", classes="user-message"),
+                )
+            elif role == "agent":
+                self.call_from_thread(
+                    chat_history_widget.mount,
+                    Markdown(content, classes="agent-message"),
+                )
+
+    def _create_session_data(self) -> dict:
+        """Creates session data dictionary from current state."""
+        return {
+            "metadata": {
+                "version": 1,
+                "timestamp": datetime.datetime.now().isoformat(),
+                "model_id": self.model_id,
+            },
+            "ui_history": self._capture_ui_history(),
+            "agent_memory_steps": self._capture_agent_memory(),
+        }
+
+    def save_session(self, name: str | None):
+        """Saves the current chat session to a file."""
+        try:
+            path = self._get_session_path(name)
+            path.parent.mkdir(parents=True, exist_ok=True)
+
+            session_data = self._create_session_data()
+
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(session_data, f, indent=2, cls=VibeAgentJSONEncoder)
+
+            self._show_session_message(f"Session saved to {path}")
+
+        except Exception as e:
+            self._show_session_message(f"Error saving session: {e}", is_error=True)
+            logging.error(f"Error saving session: {e}", exc_info=True)
+
+    def delete_session(self, name: str | None):
+        """Deletes a saved session file."""
+        if name is None:
+            self._show_session_message(
+                "Usage: /delete <session_name>", is_error=True, from_thread=True
+            )
+            return
+
+        try:
+            path = self._get_session_path(name)
+            if not self._validate_session_file(path, "delete", from_thread=True):
+                return
+
+            path.unlink()
+            self._show_session_message(f"Session '{name}' deleted.", from_thread=True)
+
+        except Exception as e:
+            self._show_session_message(
+                f"Error deleting session: {e}", is_error=True, from_thread=True
+            )
+            logging.error(f"Error deleting session: {e}", exc_info=True)
+
+    def load_session(self, name: str | None):
+        """Loads a chat session from a file."""
+        try:
+            path = self._get_session_path(name)
+            if not self._validate_session_file(path, "load", from_thread=True):
+                return
+
+            with open(path, "r", encoding="utf-8") as f:
+                session_data = json.load(f)
+
+            # Restore agent memory
+            self._reconstruct_agent_memory(session_data.get("agent_memory_steps", []))
+
+            # Restore UI
+            self._restore_ui_history(session_data.get("ui_history", []))
+
+            # Restore model if different
+            model_id = session_data.get("metadata", {}).get("model_id")
+            if model_id and model_id != self.model_id:
+                self.call_from_thread(self.update_agent_with_new_model, model_id)
+                self._show_session_message(
+                    f"Switched to session model: {model_id}", from_thread=True
+                )
+
+            self._show_session_message(
+                f"Session '{path.stem}' loaded.", from_thread=True
+            )
+
+        except Exception as e:
+            self._show_session_message(
+                f"Error loading session: {e}", is_error=True, from_thread=True
+            )
+            logging.error(f"Error loading session: {e}", exc_info=True)
 
     async def fetch_models(self) -> None:
         """Fetches available models from all enabled OpenAI-compatible endpoints."""
@@ -1019,6 +1281,14 @@ class ChatApp(App):
         chat_history.mount(Markdown(response_text, classes="agent-message"))
         chat_history.scroll_end()
 
+    def list_sessions(self) -> list[str]:
+        """Lists available session files in the sessions directory, excluding '_default'."""
+        if not self.sessions_dir.exists():
+            return []
+        return [
+            f.stem for f in self.sessions_dir.glob("*.json") if f.stem != "_default"
+        ]
+
     def get_autocomplete_candidates(self, state: TargetState) -> list[DropdownItem]:
         """Provides dynamic candidates for the autocomplete dropdown."""
         text = state.text.lstrip()
@@ -1045,6 +1315,14 @@ class ChatApp(App):
                 return [
                     DropdownItem(f"/compress {strategy}") for strategy in strategies
                 ]
+            elif command == "/save":
+                return [DropdownItem(f"/save {name}") for name in self.list_sessions()]
+            elif command == "/load":
+                return [DropdownItem(f"/load {name}") for name in self.list_sessions()]
+            elif command == "/delete":
+                return [
+                    DropdownItem(f"/delete {name}") for name in self.list_sessions()
+                ]
             else:
                 return []  # No suggestions for arguments of other commands for now
         else:
@@ -1057,6 +1335,9 @@ class ChatApp(App):
                 "/compress",
                 "/dump-context",
                 "/show-settings",
+                "/save",
+                "/load",
+                "/delete",
             ]
             return [DropdownItem(cmd) for cmd in commands]
 
@@ -1080,6 +1361,15 @@ class ChatApp(App):
 
         if command == "/quit":
             self.exit()
+            return True
+        if command == "/save":
+            self.save_session(arg)
+            return True
+        if command == "/load":
+            self.run_worker(partial(self.load_session, arg), thread=True)
+            return True
+        if command == "/delete":
+            self.run_worker(partial(self.delete_session, arg), thread=True)
             return True
 
         if command == "/xyzzy":
@@ -1705,8 +1995,10 @@ def main():
     APP_NAME = "vibeagent"
     config_dir = Path(platformdirs.user_config_dir(APP_NAME))
     log_dir = Path(platformdirs.user_log_dir(APP_NAME))
+    data_dir = Path(platformdirs.user_data_dir(APP_NAME))
     config_dir.mkdir(parents=True, exist_ok=True)
     log_dir.mkdir(parents=True, exist_ok=True)
+    data_dir.mkdir(parents=True, exist_ok=True)
 
     # Load settings to get model configuration
     def load_settings(config_dir: Path):
@@ -1786,6 +2078,7 @@ def main():
         initial_model_id=initial_model_id,
         config_dir=config_dir,
         log_dir=log_dir,
+        data_dir=data_dir,
     )
     app.settings = settings  # Set the settings after instantiation
     app.run()
