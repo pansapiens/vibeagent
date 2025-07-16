@@ -20,6 +20,7 @@ import argparse
 import time
 import random
 import string
+import shlex
 import datetime
 from functools import partial
 from pathlib import Path
@@ -216,12 +217,6 @@ class ModelSelectProvider(Provider):
                 self.app.action_select_model,
                 help="Choose a different LLM to chat with.",
             )
-
-
-class SessionOperationError(Exception):
-    """Exception raised when session operations fail."""
-
-    pass
 
 
 class ChatApp(App):
@@ -634,12 +629,26 @@ class ChatApp(App):
         session_name = name if name is not None else "_default"
         return self.sessions_dir / f"{session_name}.json"
 
-    def _show_session_message(
-        self, message: str, is_error: bool = False, from_thread: bool = False
+    def _display_ui_message(
+        self,
+        message: str,
+        is_error: bool = False,
+        from_thread: bool = False,
+        render_as_markdown: bool = False,
+        exc_info: bool = False,
     ):
-        """Helper to display session-related messages in the UI."""
-        message_class = "error-message" if is_error else "info-message"
-        widget = Static(message, classes=message_class)
+        """Helper to display info or error messages in the UI and log errors."""
+        if is_error:
+            logging.error(message, exc_info=exc_info)
+            message_class = "error-message"
+        else:
+            message_class = "info-message"
+
+        widget = (
+            Markdown(message, classes=message_class)
+            if render_as_markdown
+            else Static(message, classes=message_class)
+        )
 
         if from_thread:
             self.call_from_thread(self.query_one("#chat-history").mount, widget)
@@ -653,7 +662,7 @@ class ChatApp(App):
     ) -> bool:
         """Validates session file existence for operations that need it."""
         if not path.exists():
-            self._show_session_message(
+            self._display_ui_message(
                 f"Session file not found: {path}",
                 is_error=True,
                 from_thread=from_thread,
@@ -798,16 +807,17 @@ class ChatApp(App):
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(session_data, f, indent=2, cls=VibeAgentJSONEncoder)
 
-            self._show_session_message(f"Session saved to {path}")
+            self._display_ui_message(f"Session saved to {path}")
 
         except Exception as e:
-            self._show_session_message(f"Error saving session: {e}", is_error=True)
-            logging.error(f"Error saving session: {e}", exc_info=True)
+            self._display_ui_message(
+                f"Error saving session: {e}", is_error=True, exc_info=True
+            )
 
     def delete_session(self, name: str | None):
         """Deletes a saved session file."""
         if name is None:
-            self._show_session_message(
+            self._display_ui_message(
                 "Usage: /delete <session_name>", is_error=True, from_thread=True
             )
             return
@@ -818,13 +828,15 @@ class ChatApp(App):
                 return
 
             path.unlink()
-            self._show_session_message(f"Session '{name}' deleted.", from_thread=True)
+            self._display_ui_message(f"Session '{name}' deleted.", from_thread=True)
 
         except Exception as e:
-            self._show_session_message(
-                f"Error deleting session: {e}", is_error=True, from_thread=True
+            self._display_ui_message(
+                f"Error deleting session: {e}",
+                is_error=True,
+                from_thread=True,
+                exc_info=True,
             )
-            logging.error(f"Error deleting session: {e}", exc_info=True)
 
     def load_session(self, name: str | None):
         """Loads a chat session from a file."""
@@ -846,19 +858,19 @@ class ChatApp(App):
             model_id = session_data.get("metadata", {}).get("model_id")
             if model_id and model_id != self.model_id:
                 self.call_from_thread(self.update_agent_with_new_model, model_id)
-                self._show_session_message(
+                self._display_ui_message(
                     f"Switched to session model: {model_id}", from_thread=True
                 )
 
-            self._show_session_message(
-                f"Session '{path.stem}' loaded.", from_thread=True
-            )
+            self._display_ui_message(f"Session '{path.stem}' loaded.", from_thread=True)
 
         except Exception as e:
-            self._show_session_message(
-                f"Error loading session: {e}", is_error=True, from_thread=True
+            self._display_ui_message(
+                f"Error loading session: {e}",
+                is_error=True,
+                from_thread=True,
+                exc_info=True,
             )
-            logging.error(f"Error loading session: {e}", exc_info=True)
 
     async def fetch_models(self) -> None:
         """Fetches available models from all enabled OpenAI-compatible endpoints."""
@@ -866,12 +878,8 @@ class ChatApp(App):
 
         endpoints = self.model_config.get("endpoints", {})
         if not endpoints:
-            self.call_from_thread(
-                self.query_one("#chat-history").mount,
-                Static(
-                    "No model endpoints configured in settings.",
-                    classes="error-message",
-                ),
+            self._display_ui_message(
+                "No model endpoints configured in settings.", is_error=True
             )
             return
 
@@ -897,14 +905,11 @@ class ChatApp(App):
                     for model in provider_models:
                         model_id_counts[model.id] = model_id_counts.get(model.id, 0) + 1
             except Exception as e:
-                self.call_from_thread(
-                    self.query_one("#chat-history").mount,
-                    Static(
-                        f"Error fetching models from {provider_name}: {e}",
-                        classes="error-message",
-                    ),
+                self._display_ui_message(
+                    f"Error fetching models from {provider_name}: {e}",
+                    is_error=True,
+                    exc_info=True,
                 )
-                logging.error(f"Error fetching models from {provider_name}: {e}")
 
         new_available_models = []
         new_model_context_lengths = {}
@@ -931,12 +936,8 @@ class ChatApp(App):
         self.model_context_lengths = new_model_context_lengths
         self.model_details = new_model_details
 
-        self.call_from_thread(
-            self.query_one("#chat-history").mount,
-            Static(
-                f"Found {len(self.available_models)} available models from {len(all_models_by_provider)} provider(s).",
-                classes="info-message",
-            ),
+        self._display_ui_message(
+            f"Found {len(self.available_models)} available models from {len(all_models_by_provider)} provider(s)."
         )
 
     def on_mount(self) -> None:
@@ -947,13 +948,7 @@ class ChatApp(App):
 
         # provider = trace.get_tracer_provider()
         # provider.add_span_processor(SimpleSpanProcessor(self.TextualSpanExporter(self)))
-        chat_history = self.query_one("#chat-history")
-        chat_history.mount(
-            Static(
-                "Initializing agent and connecting to tool servers...",
-                classes="info-message",
-            )
-        )
+        self._display_ui_message("Initializing agent and connecting to tool servers...")
         self.favorite_models = self.settings.get("favoriteModels", [])
         self.run_worker(self.fetch_models, thread=True)
 
@@ -964,6 +959,7 @@ class ChatApp(App):
             name="setup_agent",
             thread=True,
         )
+        chat_history = self.query_one("#chat-history")
         chat_history.mount(LoadingIndicator(classes="agent-thinking"))
         chat_history.scroll_end()
 
@@ -980,6 +976,150 @@ class ChatApp(App):
                 log_file.close()
             except:
                 pass
+
+    def _wrap_command_for_docker(
+        self, server_name: str, command: str, args: list[str], container_settings: dict
+    ) -> tuple[str, list[str]]:
+        """Wraps a command to be run inside a Docker container."""
+        image = container_settings.get("image")
+        home_mount_point = container_settings.get("home_mount_point")
+
+        docker_cmd = "docker"
+        docker_args = [
+            "run",
+            "--rm",
+            "-i",
+        ]  # Run, remove on exit, and interactive for stdin
+
+        # Match host user UID/GID to avoid permission issues
+        if sys.platform in ["linux", "darwin"]:
+            uid = os.getuid()
+            gid = os.getgid()
+            docker_args.extend(["--user", f"{uid}:{gid}"])
+
+        # Create and mount an isolated home directory for the server's dependencies
+        mcp_servers_data_dir = self.data_dir / "mcp-servers"
+        server_home_dir = mcp_servers_data_dir / server_name
+        server_home_dir.mkdir(parents=True, exist_ok=True)
+        docker_args.extend(["-v", f"{server_home_dir.resolve()}:{home_mount_point}"])
+
+        # Mount allowedPaths read-write
+        allowed_paths = self.settings.get("allowedPaths", [])
+        resolved_workdir = None
+        for path_str in allowed_paths:
+            path = Path(path_str).resolve()
+            if path.exists():
+                docker_args.extend(["-v", f"{path}:{path}:rw"])
+                if (
+                    resolved_workdir is None
+                ):  # Set workdir to the first valid allowed path
+                    resolved_workdir = path
+
+        # Set workdir. If no allowed paths, use home directory inside container
+        if resolved_workdir:
+            docker_args.extend(["--workdir", str(resolved_workdir)])
+        else:
+            docker_args.extend(["--workdir", home_mount_point])
+
+        # The container image to use
+        docker_args.append(image)
+
+        # The original command and its arguments
+        docker_args.append(command)
+        docker_args.extend(args)
+
+        logging.info(f"Wrapped command for '{server_name}' to run in Docker.")
+        return docker_cmd, docker_args
+
+    def _wrap_command_for_apptainer(
+        self, server_name: str, command: str, args: list[str], container_settings: dict
+    ) -> tuple[str, list[str]]:
+        """Wraps a command to be run inside an Apptainer container."""
+        image = container_settings.get("image")
+        home_mount_point = container_settings.get("home_mount_point")
+
+        apptainer_cmd = "apptainer"
+        apptainer_args = ["run", "--cleanenv"]  # --cleanenv for better isolation
+
+        # Create and mount an isolated home directory for the server's dependencies
+        mcp_servers_data_dir = self.data_dir / "mcp-servers"
+        server_home_dir = mcp_servers_data_dir / server_name
+        server_home_dir.mkdir(parents=True, exist_ok=True)
+        apptainer_args.extend(
+            ["--home", f"{server_home_dir.resolve()}:{home_mount_point}"]
+        )
+
+        # Mount allowedPaths read-write
+        allowed_paths = self.settings.get("allowedPaths", [])
+        resolved_workdir = None
+        for path_str in allowed_paths:
+            path = Path(path_str).resolve()
+            if path.exists():
+                apptainer_args.extend(["--bind", f"{path}:{path}:rw"])
+                if resolved_workdir is None:  # Set workdir to first valid path
+                    resolved_workdir = path
+
+        # Set workdir
+        if resolved_workdir:
+            apptainer_args.extend(["--pwd", str(resolved_workdir)])
+
+        # Image URI must be specified for Apptainer
+        apptainer_args.append(f"docker://{image}")
+
+        # Original command
+        apptainer_args.append(command)
+        apptainer_args.extend(args)
+
+        logging.info(f"Wrapped command for '{server_name}' to run in Apptainer.")
+        return apptainer_cmd, apptainer_args
+
+    def _wrap_command_for_container(
+        self, server_name: str, server_config: dict
+    ) -> tuple[str, list[str]]:
+        """Wraps a command to be run inside a container if enabled."""
+        container_settings = self.settings.get("containers", {})
+
+        command = str(server_config.get("command"))
+        args = server_config.get("args", [])
+
+        # Only wrap if containers are enabled
+        if not container_settings.get("enabled", False):
+            return command, args
+
+        # Check if command is already a container command to avoid double-wrapping
+        if command in ["docker", "apptainer"]:
+            return command, args
+
+        full_command_str = f"{command} {' '.join(args)}"
+        if "docker run" in full_command_str or "apptainer run" in full_command_str:
+            return command, args
+
+        engine = container_settings.get("engine", "docker")
+        image = container_settings.get("image")
+        home_mount_point = container_settings.get("home_mount_point")
+
+        if not image or not home_mount_point:
+            logging.warning(
+                f"Container for '{server_name}' is not configured properly (missing image or home_mount_point). Running on host."
+            )
+            return command, args
+
+        common_args = {
+            "server_name": server_name,
+            "command": command,
+            "args": args,
+            "container_settings": container_settings,
+        }
+
+        if engine == "docker":
+            return self._wrap_command_for_docker(**common_args)
+        elif engine == "apptainer":
+            return self._wrap_command_for_apptainer(**common_args)
+        else:
+            logging.warning(
+                f"Container engine '{engine}' not supported. Running '{server_name}' on host."
+            )
+            return command, args
 
     def setup_agent_and_tools(self, settings):
         """Initializes the MCP client and the agent with all available tools."""
@@ -1083,8 +1223,7 @@ class ChatApp(App):
                         logging.info(f"Skipping disabled MCP server: {name}")
                         continue
 
-                    command = config.get("command")
-                    args = config.get("args", [])
+                    command, args = self._wrap_command_for_container(name, config)
                     env = config.get("env", {})
                     if command:
                         full_env = {**os.environ, **env}
@@ -1099,10 +1238,14 @@ class ChatApp(App):
 
                         logging.info(f"[{name}] Creating StdioServerParameters...")
                         server_param = StdioServerParameters(
-                            command=command, args=args, env=full_env
+                            command=command,
+                            args=args,
+                            env=full_env,
                         )
                         logging.info(f"[{name}] Creating MCPClient...")
-                        client = MCPClient([server_param])
+                        client = MCPClient(
+                            [server_param],
+                        )
                         self.mcp_clients.append(client)
 
                         logging.info(f"[{name}] Getting tools from server...")
@@ -1129,11 +1272,11 @@ class ChatApp(App):
                 except:
                     pass
 
-                self.call_from_thread(
-                    self.query_one("#chat-history").mount,
-                    Static(
-                        f"Error connecting to MCP servers: {e}", classes="error-message"
-                    ),
+                self._display_ui_message(
+                    f"Error connecting to MCP servers: {e}",
+                    is_error=True,
+                    from_thread=True,
+                    exc_info=True,
                 )
 
                 # Close log files on error
@@ -1155,11 +1298,8 @@ class ChatApp(App):
         """Creates a new agent with the specified model."""
         if model_id not in self.model_details:
             if not startup:
-                self.query_one("#chat-history").mount(
-                    Static(
-                        f"Error: Details for model '{model_id}' not found.",
-                        classes="error-message",
-                    )
+                self._display_ui_message(
+                    f"Error: Details for model '{model_id}' not found.", is_error=True
                 )
             # Don't proceed if we don't have details. fetch_models should run first.
             return
@@ -1191,10 +1331,7 @@ class ChatApp(App):
         self.query_one(Header).title = f"vibeagent ({self.model_id})"
 
         if not startup:
-            chat_history = self.query_one("#chat-history")
-            chat_history.mount(
-                Static(f"Switched to model: {self.model_id}", classes="info-message")
-            )
+            self._display_ui_message(f"Switched to model: {self.model_id}")
             logging.info(f"Model switched to: {self.model_id}")
 
     async def on_worker_state_changed(self, event: Worker.StateChanged) -> None:
@@ -1205,11 +1342,8 @@ class ChatApp(App):
                 # The worker is done, update the UI.
                 self.is_loading = False
                 logging.info(f"Model initialized: {self.model_id}")
-                self.query_one("#chat-history").mount(
-                    Static(
-                        f"Agent is ready. Model: {self.model_id}. Type your message and press Enter.",
-                        classes="info-message",
-                    )
+                self._display_ui_message(
+                    f"Agent is ready. Model: {self.model_id}. Type your message and press Enter."
                 )
                 try:
                     self.query_one(".agent-thinking").remove()
@@ -1220,12 +1354,10 @@ class ChatApp(App):
             elif event.worker.state == WorkerState.ERROR:
                 # The worker failed
                 self.is_loading = False
-                logging.error(f"Agent setup failed: {event.worker.error}")
-                self.query_one("#chat-history").mount(
-                    Static(
-                        "Agent initialization failed. Check logs.",
-                        classes="error-message",
-                    )
+                self._display_ui_message(
+                    f"Agent setup failed: {event.worker.error}",
+                    is_error=True,
+                    exc_info=True,
                 )
                 try:
                     self.query_one(".agent-thinking").remove()
@@ -1259,7 +1391,6 @@ class ChatApp(App):
                 self.post_message(self.AgentResponse(response))
             except Exception as e:
                 self.post_message(self.AgentResponse(f"Error: {str(e)}"))
-                logging.error(f"Agent response error: {e}", exc_info=True)
 
     def on_chat_app_agent_response(self, message: AgentResponse) -> None:
         """Handles the agent's response."""
@@ -1395,8 +1526,7 @@ class ChatApp(App):
                     f"Glitch mode {'enabled' if self.glitch_mode else 'disabled'}."
                 )
 
-            # chat_history.mount(Static(message, classes="info-message"))
-            # chat_history.scroll_end()
+            self._display_ui_message(message)
             return True
 
         if command == "/tools":
@@ -1404,10 +1534,7 @@ class ChatApp(App):
             return True
 
         if command == "/refresh-models":
-            chat_history.mount(
-                Static("Refreshing model list from API...", classes="info-message")
-            )
-            chat_history.scroll_end()
+            self._display_ui_message("Refreshing model list from API...")
             self.run_worker(self.fetch_models, thread=True)
             return True
 
@@ -1450,13 +1577,9 @@ class ChatApp(App):
             return
 
         if not self.agent:
-            chat_history.mount(
-                Static(
-                    "Agent is not yet initialized. Please wait.",
-                    classes="error-message",
-                )
+            self._display_ui_message(
+                "Agent is not yet initialized. Please wait.", is_error=True
             )
-            chat_history.scroll_end()
             return
 
         self.is_loading = True
@@ -1490,7 +1613,6 @@ class ChatApp(App):
         # For now, we will rely on the periodic `fetch_models` to discover models.
         # This function will just check if the model is in our available list.
 
-        chat_history = self.query_one("#chat-history")
         if model_id in self.available_models:
             self.call_from_thread(self.update_agent_with_new_model, model_id)
         else:
@@ -1499,25 +1621,17 @@ class ChatApp(App):
             if model_id in self.available_models:
                 self.call_from_thread(self.update_agent_with_new_model, model_id)
             else:
-                self.call_from_thread(
-                    chat_history.mount,
-                    Static(
-                        f"Model '{model_id}' not found after refreshing. Please check the name or provider.",
-                        classes="error-message",
-                    ),
+                self._display_ui_message(
+                    f"Model '{model_id}' not found after refreshing. Please check the name or provider.",
+                    is_error=True,
                 )
 
     def list_tools(self) -> None:
         """Displays the list of available tools."""
-        chat_history = self.query_one("#chat-history")
         if not self.agent or not hasattr(self.agent, "tools"):
-            chat_history.mount(
-                Static(
-                    "No tools available or agent not initialized.",
-                    classes="error-message",
-                )
+            self._display_ui_message(
+                "No tools available or agent not initialized.", is_error=True
             )
-            chat_history.scroll_end()
             return
 
         tool_items = []
@@ -1557,8 +1671,7 @@ class ChatApp(App):
                 tool_items[0] = tool_items[0][1:]
             tool_list_str = "\n".join(tool_items)
 
-        chat_history.mount(Static(tool_list_str, classes="info-message"))
-        chat_history.scroll_end()
+        self._display_ui_message(tool_list_str)
 
     def action_history_prev(self) -> None:
         """Go to the previous command in history."""
@@ -1586,13 +1699,10 @@ class ChatApp(App):
     def action_select_model(self) -> None:
         """Show the model selection screen."""
         if not self.available_models:
-            self.query_one("#chat-history").mount(
-                Static(
-                    "Model list not available yet. Please try again shortly.",
-                    classes="error-message",
-                )
+            self._display_ui_message(
+                "Model list not available yet. Please try again shortly.",
+                is_error=True,
             )
-            self.query_one("#chat-history").scroll_end()
             return
 
         def on_model_selected(model_id: str):
@@ -1623,13 +1733,14 @@ class ChatApp(App):
             except Exception:
                 pass  # It might have already been removed
 
-            chat_history.mount(Static("Request cancelled.", classes="info-message"))
+            self._display_ui_message("Request cancelled.")
             self.query_one(Input).placeholder = "Ask the agent to do something..."
             chat_history.scroll_end()
 
     def get_current_context_tokens(self) -> int:
         """Calculates the total token count from the agent's memory."""
         if not self.agent or not self.agent.memory.steps:
+            self._display_ui_message("Agent is not initialized.", is_error=True)
             return 0
 
         total_tokens = 0
@@ -1681,9 +1792,7 @@ class ChatApp(App):
     def dump_context(self, output_format: str = "markdown"):
         """Dumps the current context to the UI."""
         if not self.agent:
-            self.query_one("#chat-history").mount(
-                Static("Agent is not initialized.", classes="error-message")
-            )
+            self._display_ui_message("Agent is not initialized.", is_error=True)
             return
 
         chat_history = self.query_one("#chat-history")
@@ -1700,11 +1809,11 @@ class ChatApp(App):
             else:
                 markdown_content = self._format_context_as_markdown(messages_as_dicts)
 
-            chat_history.mount(Markdown(markdown_content, classes="info-message"))
+            self._display_ui_message(markdown_content, render_as_markdown=True)
 
         except Exception as e:
-            chat_history.mount(
-                Static(f"Error dumping context: {e}", classes="error-message")
+            self._display_ui_message(
+                f"Error dumping context: {e}", is_error=True, exc_info=True
             )
         finally:
             chat_history.scroll_end()
@@ -1722,32 +1831,49 @@ class ChatApp(App):
                 settings_dump = "settings.json not found."
 
             info_text = (
-                f"**Config Path:** {self.config_dir}\n\n"
-                f"**Logs Path:**   {self.log_dir}\n\n"
+                f"**Config Path:**   {self.config_dir}\n\n"
+                f"**Data Path:**     {self.data_dir}\n\n"
+                f"**Logs Path:**     {self.log_dir}\n\n"
+                f"**Sessions Path:** {self.sessions_dir}\n\n"
                 f"**settings.json:**\n\n"
                 f"```json\n{settings_dump}\n```"
             )
 
-            chat_history.mount(Markdown(info_text, classes="info-message"))
+            # If container mode is enabled, show the commands
+            container_settings = self.settings.get("containers", {})
+            if container_settings.get("enabled", False):
+                server_configs = self.settings.get("mcpServers", {})
+                command_list = ["\n\n**Container Launch Commands:**\n"]
+                for name, config in server_configs.items():
+                    if config.get("disabled", False):
+                        continue
+                    command, args = self._wrap_command_for_container(name, config)
+                    # Don't show unwrapped commands
+                    if command in ["docker", "apptainer"]:
+                        full_command = " ".join(
+                            [command] + [shlex.quote(str(arg)) for arg in args]
+                        )
+                        command_list.append(f"_{name}_: `{full_command}`")
+
+                if len(command_list) > 1:
+                    info_text += "\n\n".join(command_list)
+
+            self._display_ui_message(info_text, render_as_markdown=True)
 
         except Exception as e:
-            chat_history.mount(
-                Static(f"Error showing settings: {e}", classes="error-message")
+            self._display_ui_message(
+                f"Error showing settings: {e}", is_error=True, exc_info=True
             )
         finally:
             chat_history.scroll_end()
 
     def compress_context(self, strategy: str):
         if not self.agent:
-            self.query_one("#chat-history").mount(
-                Static("Agent is not initialized.", classes="error-message")
-            )
+            self._display_ui_message("Agent is not initialized.", is_error=True)
             return
 
         if strategy not in ["drop_oldest", "middle_out", "summarize"]:
-            self.query_one("#chat-history").mount(
-                Static(f"Unknown strategy: {strategy}", classes="error-message")
-            )
+            self._display_ui_message(f"Unknown strategy: {strategy}", is_error=True)
             return
 
         initial_tokens = self.get_current_context_tokens()
@@ -1848,11 +1974,8 @@ class ChatApp(App):
 
         # Display final result
         new_tokens = self.get_current_context_tokens()
-        chat_history.mount(
-            Static(
-                f"Context compressed from {initial_tokens} to {new_tokens} tokens.",
-                classes="info-message",
-            )
+        self._display_ui_message(
+            f"Context compressed from {initial_tokens} to {new_tokens} tokens."
         )
         chat_history.scroll_end()
 
@@ -1910,6 +2033,13 @@ class ChatApp(App):
 
         return "".join(glitched_chars)
 
+    def _get_model_by_name(self, model_name: str) -> "Model":
+        """Returns a model from the list of available models."""
+        for model in self.available_models:
+            if model.lower() == model_name.lower():
+                return model
+        return None
+
 
 # Embedded default settings
 DEFAULT_SETTINGS = {
@@ -1945,6 +2075,12 @@ DEFAULT_SETTINGS = {
         "google/gemma-3n-e4b-it",
     ],
     "allowedPaths": ["$HOME/ai_workspace"],
+    "containers": {
+        "enabled": False,
+        "engine": "docker",
+        "image": "vibeagent-mcp:latest",
+        "home_mount_point": "/home/agent",
+    },
     "mcpServers": {
         "filesystem": {
             "command": "npx",
@@ -1953,29 +2089,45 @@ DEFAULT_SETTINGS = {
                 "@modelcontextprotocol/server-filesystem",
                 "$HOME/ai_workspace",
             ],
+            "enabled": True,
         },
         "shell": {
             "command": "uvx",
             "args": ["mcp-shell-server"],
             "env": {"ALLOW_COMMANDS": "ls,cat,pwd,grep,wc,touch,find,jq"},
+            "enabled": True,
         },
-        "text-editor": {"command": "uvx", "args": ["mcp-text-editor"]},
-        "fetch": {"command": "uvx", "args": ["mcp-server-fetch"]},
+        "text-editor": {
+            "command": "uvx",
+            "args": ["mcp-text-editor"],
+            "enabled": True,
+        },
+        "fetch": {
+            "command": "uvx",
+            "args": ["mcp-server-fetch"],
+            "enabled": True,
+        },
         "playwright": {
             "command": "npx",
             "args": ["@executeautomation/playwright-mcp-server"],
             "disabled": False,
             "autoApprove": [],
+            "enabled": True,
         },
         "wcgw": {
             "command": "uv",
             "args": ["tool", "run", "--python", "3.12", "wcgw@latest"],
+            "enabled": True,
         },
-        "pubmed": {"command": "uvx", "args": ["--quiet", "pubmedmcp@latest"]},
-        "searxng": {"command": "npx", "args": ["-y", "mcp-searxng"]},
+        "searxng": {
+            "command": "npx",
+            "args": ["-y", "mcp-searxng"],
+            "enabled": True,
+        },
         "pollinations": {
             "command": "npx",
             "args": ["@pollinations/model-context-protocol"],
+            "enabled": True,
         },
     },
 }
