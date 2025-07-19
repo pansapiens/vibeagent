@@ -1019,6 +1019,16 @@ class ChatApp(App):
         self.favorite_models = self.settings.get("favoriteModels", [])
         self.run_worker(self.fetch_models, thread=True)
 
+        # Check and pull container image in main thread before starting worker
+        container_settings = self.settings.get("containers", {})
+        if container_settings.get("enabled", False):
+            if not self._check_and_pull_container_image():
+                self._display_ui_message(
+                    "Failed to pull container image. MCP servers may not work properly. Check that Docker/Apptainer is installed and running.",
+                    is_error=True,
+                )
+                # Continue anyway - the worker will handle MCP server setup
+
         self.is_loading = True
         self.query_one(Input).placeholder = "Initializing agent..."
         self.run_worker(
@@ -1188,9 +1198,204 @@ class ChatApp(App):
             )
             return command, args
 
+    def _check_container_engine_available(self, engine: str) -> bool:
+        """Check if the specified container engine is available."""
+        import subprocess
+
+        try:
+            if engine == "docker":
+                result = subprocess.run(
+                    ["docker", "--version"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                return result.returncode == 0
+            elif engine == "apptainer":
+                result = subprocess.run(
+                    ["apptainer", "--version"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                return result.returncode == 0
+            else:
+                return False
+        except Exception:
+            return False
+
+    def _check_and_pull_container_image(self) -> bool:
+        """Check if container image exists and pull it if needed. Returns True if successful."""
+        container_settings = self.settings.get("containers", {})
+
+        if not container_settings.get("enabled", False):
+            return True
+
+        engine = container_settings.get("engine", "docker")
+        image = container_settings.get("image")
+
+        if not image:
+            self._display_ui_message(
+                "Container enabled but no image specified in settings",
+                is_error=True,
+            )
+            return False
+
+        # Check if the container engine is available
+        if not self._check_container_engine_available(engine):
+            self._display_ui_message(
+                f"Container engine '{engine}' is not available. Please install {engine} and ensure it's in your PATH.",
+                is_error=True,
+            )
+            return False
+
+        try:
+            if engine == "docker":
+                return self._check_and_pull_docker_image(image)
+            elif engine == "apptainer":
+                return self._check_and_pull_apptainer_image(image)
+            else:
+                self._display_ui_message(
+                    f"Unsupported container engine: {engine}",
+                    is_error=True,
+                )
+                return False
+        except Exception as e:
+            self._display_ui_message(
+                f"Error checking/pulling container image: {e}",
+                is_error=True,
+            )
+            return False
+
+    def _check_and_pull_docker_image(self, image: str) -> bool:
+        """Check if Docker image exists and pull it if needed."""
+        import subprocess
+
+        try:
+            # Check if image exists locally
+            result = subprocess.run(
+                ["docker", "images", "-q", image],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+
+            if result.returncode == 0 and result.stdout.strip():
+                logging.info(f"Docker image {image} already exists locally")
+                return True
+
+            # Image doesn't exist, pull it
+            self._display_ui_message(f"Pulling Docker image {image}...")
+
+            # Add loading indicator
+            chat_history = self.query_one("#chat-history")
+            loading_indicator = LoadingIndicator(classes="agent-thinking")
+            chat_history.mount(loading_indicator)
+            chat_history.scroll_end()
+
+            try:
+                result = subprocess.run(
+                    ["docker", "pull", image],
+                    capture_output=True,
+                    text=True,
+                    timeout=300,  # 5 minutes timeout for pull
+                )
+
+                # Remove loading indicator
+                loading_indicator.remove()
+
+                if result.returncode == 0:
+                    return True
+                else:
+                    error_msg = (
+                        result.stderr.strip() if result.stderr else "Unknown error"
+                    )
+                    self._display_ui_message(
+                        f"Failed to pull Docker image {image}: {error_msg}",
+                        is_error=True,
+                    )
+                    return False
+
+            except subprocess.TimeoutExpired:
+                loading_indicator.remove()
+                self._display_ui_message(
+                    f"Timeout pulling Docker image {image}",
+                    is_error=True,
+                )
+                return False
+
+        except Exception as e:
+            self._display_ui_message(
+                f"Error checking/pulling Docker image {image}: {e}",
+                is_error=True,
+            )
+            return False
+
+    def _check_and_pull_apptainer_image(self, image: str) -> bool:
+        """Pull Apptainer image (always pulls since cache checking is unreliable)."""
+        import subprocess
+
+        try:
+            # Always pull Apptainer images since cache checking is unreliable
+            self._display_ui_message(f"Pulling Apptainer image docker://{image}...")
+
+            # Add loading indicator
+            chat_history = self.query_one("#chat-history")
+            loading_indicator = LoadingIndicator(classes="agent-thinking")
+            chat_history.mount(loading_indicator)
+            chat_history.scroll_end()
+
+            try:
+                # Use apptainer run with a no-op to pull and cache the image without creating a .sif file
+                result = subprocess.run(
+                    ["apptainer", "run", f"docker://{image}", "echo", "Done!"],
+                    capture_output=True,
+                    text=True,
+                    timeout=300,  # 5 minutes timeout for pull
+                )
+
+                # Remove loading indicator
+                loading_indicator.remove()
+
+                if result.returncode == 0:
+                    return True
+                else:
+                    error_msg = (
+                        result.stderr.strip() if result.stderr else "Unknown error"
+                    )
+                    self._display_ui_message(
+                        f"Failed to pull Apptainer image docker://{image}: {error_msg}",
+                        is_error=True,
+                    )
+                    return False
+
+            except subprocess.TimeoutExpired:
+                loading_indicator.remove()
+                self._display_ui_message(
+                    f"Timeout pulling Apptainer image docker://{image}",
+                    is_error=True,
+                )
+                return False
+
+        except Exception as e:
+            self._display_ui_message(
+                f"Error checking/pulling Apptainer image {image}: {e}",
+                is_error=True,
+            )
+            return False
+
     def setup_agent_and_tools(self, settings):
         """Initializes the MCP client and the agent with all available tools."""
         logging.info("Starting agent and tool setup...")
+
+        # Check if containers are enabled and if we should proceed with MCP servers
+        container_settings = self.settings.get("containers", {})
+        containers_enabled = container_settings.get("enabled", False)
+
+        if containers_enabled:
+            # If containers are enabled but we're in a worker thread, we can't check/pull images here
+            # The image pulling should have been done in the main thread before this worker started
+            logging.info("Containers are enabled - MCP servers will run in containers")
 
         class CaptureIO(io.StringIO):
             encoding = "utf-8"
@@ -1253,6 +1458,9 @@ class ChatApp(App):
 
         if server_configs:
             try:
+                # Show message that we're starting MCP servers
+                self._display_ui_message("Starting MCP servers...", from_thread=True)
+                
                 # Monkey patch stdio_client to use our custom log files
                 from mcp.client.stdio import stdio_client
 
@@ -2707,7 +2915,7 @@ DEFAULT_SETTINGS = {
     "containers": {
         "enabled": False,
         "engine": "docker",
-        "image": "vibeagent-mcp:latest",
+        "image": "ghcr.io/pansapiens/vibeagent-mcp:latest",
         "home_mount_point": "/home/agent",
         "sandboxShell": False,
     },

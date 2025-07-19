@@ -6,6 +6,7 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 - **GitHub Actions**: Automated Docker image builds and publishing to GitHub Package Registry
+- **Container image management**: Automatic checking and pulling of Docker/Apptainer images before starting MCP servers
 - **Session management**: `/save`, `/load`, `/delete` commands for managing chat sessions
 - **Auto-save functionality**: Session transcripts are now automatically saved after each agent response when `"autoSave": true` is set in settings.json
 - **Shell command integration**: `!` commands to run shell commands and `!>` to send last shell output to LLM
