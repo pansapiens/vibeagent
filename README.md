@@ -163,7 +163,7 @@ The chat agent can be configured in multiple ways with the following priority (h
   "containers": {
       "enabled": false,
       "engine": "docker",
-      "image": "vibeagent-mcp:latest",
+      "image": "ghcr.io/pansapiens/vibeagent-mcp:latest",
       "home_mount_point": "/home/agent",
       "sandboxShell": false
   }
@@ -182,13 +182,23 @@ The chat agent can be configured in multiple ways with the following priority (h
 
 Typical MCP servers can be run in a container to help restrict their access to the host filesystem. This is only a weak form of sandboxing, but better than nothing.
 
-A Dockerfile `mcp.Dockerfile` is provided to build a container image that is typically compatible with most MCP servers. To build the image:
+A Dockerfile `mcp.Dockerfile` is provided to build a container image that is typically compatible with most MCP servers.
+
+### Using the pre-built image
+
+The container image is automatically built and published to the GitHub Package Registry. You can pull it directly:
+
+```bash
+docker pull ghcr.io/pansapiens/vibeagent-mcp:latest
+```
+
+### Building locally
+
+To build the image locally:
 
 ```bash
 docker build -t vibeagent-mcp:latest -f mcp.Dockerfile .
 ```
-
-Apptainer uses the same image via `docker://`.
 
 ##  Monitoring the agent, telemetry
 

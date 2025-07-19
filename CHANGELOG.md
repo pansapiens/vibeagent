@@ -5,6 +5,7 @@ All notable changes to this project will be documented in this file.
 ## [0.1.0] - 2025-07-19
 
 ### Added
+- **GitHub Actions**: Automated Docker image builds and publishing to GitHub Package Registry
 - **Session management**: `/save`, `/load`, `/delete` commands for managing chat sessions
 - **Auto-save functionality**: Session transcripts are now automatically saved after each agent response when `"autoSave": true` is set in settings.json
 - **Shell command integration**: `!` commands to run shell commands and `!>` to send last shell output to LLM
@@ -50,4 +51,5 @@ All notable changes to this project will be documented in this file.
 - **Project structure**: Added proper Python packaging with pyproject.toml
 - **Logging**: Improved log file path and model name logging
 - **Async operations**: Made agent initialization non-blocking
-- **Container support**: Added mcp.Dockerfile for containerized MCP servers 
+- **Container support**: Added mcp.Dockerfile for containerized MCP servers
+- **CI/CD**: Added GitHub Actions workflow for automated Docker image builds 
