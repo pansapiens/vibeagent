@@ -2617,15 +2617,11 @@ class ChatApp(App):
         # Send the message to the LLM
         redirect_message = "\n".join(message_parts)
 
-        # Add the message to chat history
-        chat_history = self.query_one("#chat-history")
-        chat_history.mount(Static(f"> {command}", classes="user-message"))
-        chat_history.scroll_end()
-
-        # Send to LLM
+        # Send to LLM (don't add to chat history again since it's already added in on_input_submitted)
         self.is_loading = True
         self.query_one(Input).placeholder = "Waiting for response..."
 
+        chat_history = self.query_one("#chat-history")
         chat_history.mount(LoadingIndicator(classes="agent-thinking"))
         chat_history.scroll_end()
 
