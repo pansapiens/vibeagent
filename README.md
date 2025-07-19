@@ -49,7 +49,9 @@ Commands starting with `!` are executed as shell commands in a pseudo-persistent
 - `!pwd` - Show current working directory
 - `!exit` - Exit the shell session (resets working directory and environment)
 
-The `!` shell session starts in the first path from `allowedPaths` in settings (default: `$HOME/ai_workspace`). The working directory, environment variables, shell functions, aliases, and shell options persist between commands
+The `!` shell session starts in the first path from `allowedPaths` in settings (default: `$HOME/ai_workspace`). The working directory, environment variables, shell functions, aliases, and shell options persist between commands.
+
+**Container Sandboxing**: When `containers.sandboxShell` is enabled in settings, shell commands run inside the configured container with `allowedPaths` mounted as volumes for isolation and security.
 
 ### Command Line Options
 
@@ -115,7 +117,14 @@ The model can be configured in multiple ways with the following priority (highes
   "favoriteModels": [
     "mistralai/devstral-small:free",
     "google/gemma-3n-e4b-it"
-  ]
+  ],
+  "containers": {
+      "enabled": false,
+      "engine": "docker",
+      "image": "vibeagent-mcp:latest",
+      "home_mount_point": "/home/agent",
+      "sandboxShell": false
+  }
 }
 ```
 
@@ -125,6 +134,7 @@ The model can be configured in multiple ways with the following priority (highes
   - `enabled`: Set to `true` to use this endpoint. This is optional and defaults to `true`.
 - `defaultModel`: The model identifier to use on startup.
 - `favoriteModels`: A list of model IDs to show at the top of the `/model` selection list.
+  - `containers`: Run MCP servers inside a container. `engine` can be `docker` or `apptainer`. `image` is the image to use. `sandboxShell` is whether to sandbox the `!` shell commands inside the container (requires `enabled: true`).
 
 ##  Monitoring the agent, telemetry
 

@@ -2162,44 +2162,73 @@ class ChatApp(App):
                 # Combine state restoration with the actual command
                 full_command = "\n".join(state_restore_commands + [shell_command])
 
-                result = subprocess.run(
-                    full_command,
-                    shell=True,
-                    capture_output=True,
-                    text=True,
-                    cwd=self.shell_working_dir,
-                    env=self.shell_env,
-                    timeout=30,
-                )
+                # Check if we need to sandbox the shell
+                container_settings = self.settings.get("containers", {})
+                sandbox_shell = container_settings.get("sandboxShell", False)
+
+                if sandbox_shell:
+                    executable, args = self._wrap_shell_command_for_container(
+                        full_command
+                    )
+                    command_to_run = [executable] + args
+                else:
+                    # For non-sandboxed shells, use the full command as a string
+                    command_to_run = full_command
+
+                try:
+                    result = subprocess.run(
+                        command_to_run,
+                        # Use shell=True for non-sandboxed (string command), shell=False for sandboxed (list command)
+                        shell=not sandbox_shell,
+                        capture_output=True,
+                        text=True,
+                        cwd=self.shell_working_dir if not sandbox_shell else None,
+                        env=self.shell_env,
+                        timeout=30,
+                    )
+                except FileNotFoundError:
+                    if sandbox_shell:
+                        self.post_message(
+                            self.ShellResponse(
+                                f"Error: Container engine '{container_settings.get('engine', 'docker')}' not found. Please ensure it is installed and in your PATH."
+                            )
+                        )
+                        return
+                    else:
+                        raise
 
                 # Update working directory if cd command was executed
-                # Parse the command to detect cd commands more robustly
-                try:
-                    parsed_command = shlex.split(shell_command)
-                    if parsed_command and parsed_command[0] == "cd":
-                        if len(parsed_command) >= 2:
-                            new_dir = parsed_command[1]
-                            # Handle tilde expansion first, then relative paths
-                            new_dir = os.path.expanduser(new_dir)
-                            if not os.path.isabs(new_dir):
-                                new_dir = os.path.join(self.shell_working_dir, new_dir)
-                            # Resolve the path
-                            new_dir = os.path.abspath(new_dir)
-                            if os.path.exists(new_dir) and os.path.isdir(new_dir):
-                                self.shell_working_dir = new_dir
-                                logging.info(
-                                    f"Working directory changed to: {self.shell_working_dir}"
-                                )
-                        elif len(parsed_command) == 1:
-                            # cd without arguments - go to home directory
-                            home_dir = os.path.expanduser("~")
-                            if os.path.exists(home_dir) and os.path.isdir(home_dir):
-                                self.shell_working_dir = home_dir
-                                logging.info(
-                                    f"Working directory changed to: {self.shell_working_dir}"
-                                )
-                except Exception as e:
-                    logging.warning(f"Failed to update working directory: {e}")
+                # This only makes sense for non-sandboxed shells.
+                # For sandboxed, the state is ephemeral inside the container for each command.
+                if not sandbox_shell:
+                    try:
+                        parsed_command = shlex.split(shell_command)
+                        if parsed_command and parsed_command[0] == "cd":
+                            if len(parsed_command) >= 2:
+                                new_dir = parsed_command[1]
+                                # Handle tilde expansion first, then relative paths
+                                new_dir = os.path.expanduser(new_dir)
+                                if not os.path.isabs(new_dir):
+                                    new_dir = os.path.join(
+                                        self.shell_working_dir, new_dir
+                                    )
+                                # Resolve the path
+                                new_dir = os.path.abspath(new_dir)
+                                if os.path.exists(new_dir) and os.path.isdir(new_dir):
+                                    self.shell_working_dir = new_dir
+                                    logging.info(
+                                        f"Working directory changed to: {self.shell_working_dir}"
+                                    )
+                            elif len(parsed_command) == 1:
+                                # cd without arguments - go to home directory
+                                home_dir = os.path.expanduser("~")
+                                if os.path.exists(home_dir) and os.path.isdir(home_dir):
+                                    self.shell_working_dir = home_dir
+                                    logging.info(
+                                        f"Working directory changed to: {self.shell_working_dir}"
+                                    )
+                    except Exception as e:
+                        logging.warning(f"Failed to update working directory: {e}")
 
                 # Format output in terminal-like style
                 output_parts = []
@@ -2244,6 +2273,33 @@ class ChatApp(App):
 
         except Exception as e:
             self.post_message(self.ShellResponse(f"Error executing command: {e}"))
+
+    def _wrap_shell_command_for_container(
+        self, shell_command: str
+    ) -> tuple[str, list[str]]:
+        """Wraps a shell command to be run inside a container."""
+        container_settings = self.settings.get("containers", {})
+        engine = container_settings.get("engine", "docker")
+
+        # The command to run inside the container is bash
+        command = "bash"
+        # The argument to bash is the shell command itself
+        args = ["-c", shell_command]
+
+        if engine == "docker":
+            return self._wrap_shell_command_for_docker(
+                shell_command, container_settings
+            )
+        elif engine == "apptainer":
+            return self._wrap_shell_command_for_apptainer(
+                shell_command, container_settings
+            )
+        else:
+            # Should not happen if settings are validated, but as a fallback
+            logging.warning(
+                f"Container engine '{engine}' not supported for sandboxed shell. Running on host."
+            )
+            return command, args
 
     def _update_title_for_shell_mode(self, is_shell_mode: bool) -> None:
         """Updates the app title to show current directory when in shell mode."""
@@ -2396,6 +2452,88 @@ class ChatApp(App):
             self.shell_aliases = {}
             self.shell_options = {}
 
+    def _wrap_shell_command_for_docker(
+        self, shell_command: str, container_settings: dict
+    ) -> tuple[str, list[str]]:
+        """Wraps a shell command to be run inside a Docker container."""
+        image = container_settings.get("image")
+        home_mount_point = container_settings.get("home_mount_point")
+
+        docker_cmd = "docker"
+        docker_args = [
+            "run",
+            "--rm",
+            "-i",
+        ]  # Run, remove on exit, and interactive for stdin
+
+        # Match host user UID/GID to avoid permission issues
+        if sys.platform in ["linux", "darwin"]:
+            uid = os.getuid()
+            gid = os.getgid()
+            docker_args.extend(["--user", f"{uid}:{gid}"])
+
+        # Mount allowedPaths read-write
+        allowed_paths = self.settings.get("allowedPaths", [])
+        resolved_workdir = None
+        for path_str in allowed_paths:
+            path = Path(path_str).resolve()
+            if path.exists():
+                docker_args.extend(["-v", f"{path}:{path}:rw"])
+                if (
+                    resolved_workdir is None
+                ):  # Set workdir to the first valid allowed path
+                    resolved_workdir = path
+
+        # Set workdir. If no allowed paths, use home directory inside container
+        if resolved_workdir:
+            docker_args.extend(["--workdir", str(resolved_workdir)])
+        else:
+            docker_args.extend(["--workdir", home_mount_point])
+
+        # The container image to use
+        docker_args.append(image)
+
+        # The shell command to run inside the container
+        docker_args.append("bash")
+        docker_args.extend(["-c", shell_command])
+
+        logging.info(f"Wrapped shell command to run in Docker: {shell_command}")
+        return docker_cmd, docker_args
+
+    def _wrap_shell_command_for_apptainer(
+        self, shell_command: str, container_settings: dict
+    ) -> tuple[str, list[str]]:
+        """Wraps a shell command to be run inside an Apptainer container."""
+        image = container_settings.get("image")
+        home_mount_point = container_settings.get("home_mount_point")
+
+        apptainer_cmd = "apptainer"
+        apptainer_args = ["run", "--cleanenv"]  # --cleanenv for better isolation
+
+        # Mount allowedPaths read-write
+        allowed_paths = self.settings.get("allowedPaths", [])
+        resolved_workdir = None
+        for path_str in allowed_paths:
+            path = Path(path_str).resolve()
+            if path.exists():
+                apptainer_args.extend(["--bind", f"{path}:{path}:rw"])
+                if resolved_workdir is None:  # Set workdir to first valid path
+                    resolved_workdir = path
+
+        # Set workdir
+        if resolved_workdir:
+            apptainer_args.extend(["--pwd", str(resolved_workdir)])
+
+        # Image URI must be specified for Apptainer
+        apptainer_args.append(f"docker://{image}")
+
+        # The shell command to run inside the container
+        apptainer_args.append("bash")
+        apptainer_args.extend(["-c", shell_command])
+
+        logging.info(f"Wrapped shell command to run in Apptainer: {shell_command}")
+        return apptainer_cmd, apptainer_args
+
 
 # Embedded default settings
 DEFAULT_SETTINGS = {
@@ -2436,6 +2574,7 @@ DEFAULT_SETTINGS = {
         "engine": "docker",
         "image": "vibeagent-mcp:latest",
         "home_mount_point": "/home/agent",
+        "sandboxShell": False,
     },
     "mcpServers": {
         "filesystem": {
