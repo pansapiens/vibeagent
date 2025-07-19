@@ -296,6 +296,16 @@ class ChatApp(App):
         border: tall $primary;
     }
 
+    Input.shell-mode {
+        border: tall $warning;
+        background: $panel;
+        color: $foreground;
+    }
+
+    Input.shell-mode:focus {
+        border: tall $warning;
+    }
+
     #model-select-dialog {
         background: $surface;
         padding: 1 2;
@@ -513,6 +523,13 @@ class ChatApp(App):
             super().__init__()
             self.tool_name = tool_name
 
+    class ShellResponse(Message):
+        """A message containing the shell command response."""
+
+        def __init__(self, response: str) -> None:
+            super().__init__()
+            self.response = response
+
     def __init__(
         self,
         model_config: dict,
@@ -522,7 +539,7 @@ class ChatApp(App):
         data_dir: Path,
     ):
         super().__init__()
-        self.title = "Vibe Agent Chat"
+        self.title = "vibeagent"
         self.agent = None
         self.mcp_clients = []
         self.command_history = []
@@ -552,6 +569,14 @@ class ChatApp(App):
         self.data_dir = data_dir
         self.sessions_dir = self.data_dir / "sessions"
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
+
+        # Shell session management
+        self.shell_working_dir = None
+        self.shell_env = None
+        self.shell_functions = {}  # Store function definitions
+        self.shell_aliases = {}  # Store aliases
+        self.shell_options = {}  # Store shell options
+        self._initialize_shell_session()
 
     def _is_phoenix_running(self) -> bool:
         import socket
@@ -946,6 +971,13 @@ class ChatApp(App):
         self.register_theme(cyberpunk_theme)
         self.theme = "cyberpunk"
 
+        # Initialize title and input styling
+        self._update_title_for_shell_mode(False)
+        self._update_input_style_for_shell_mode(False)
+
+        # Initialize shell session
+        self._initialize_shell_session()
+
         # provider = trace.get_tracer_provider()
         # provider.add_span_processor(SimpleSpanProcessor(self.TextualSpanExporter(self)))
         self._display_ui_message("Initializing agent and connecting to tool servers...")
@@ -1219,7 +1251,7 @@ class ChatApp(App):
                 for name, config in server_configs.items():
                     logging.info(f"Processing MCP server config: {name}")
                     # Skip disabled servers
-                    if config.get("disabled", False):
+                    if not config.get("enabled", True):
                         logging.info(f"Skipping disabled MCP server: {name}")
                         continue
 
@@ -1328,7 +1360,8 @@ class ChatApp(App):
             add_base_tools=True,
         )
 
-        self.query_one(Header).title = f"vibeagent ({self.model_id})"
+        # Update title with model ID
+        self.title = f"vibeagent ({self.model_id})"
 
         if not startup:
             self._display_ui_message(f"Switched to model: {self.model_id}")
@@ -1411,6 +1444,28 @@ class ChatApp(App):
 
         chat_history.mount(Markdown(response_text, classes="agent-message"))
         chat_history.scroll_end()
+
+    def on_chat_app_shell_response(self, message: ShellResponse) -> None:
+        """Handles shell command responses."""
+        # If the worker is None, it means the job was cancelled.
+        if self.agent_worker is None:
+            return
+
+        self.is_loading = False
+        self.agent_worker = None
+        self.query_one(Input).placeholder = "Ask the agent to do something..."
+
+        chat_history = self.query_one("#chat-history")
+        try:
+            chat_history.query(".agent-thinking").last().remove()
+        except Exception:
+            pass  # It might have already been removed
+
+        response_text = message.response
+        # Only mount a response widget if there's actual content
+        if response_text.strip():
+            chat_history.mount(Markdown(response_text, classes="agent-message"))
+            chat_history.scroll_end()
 
     def list_sessions(self) -> list[str]:
         """Lists available session files in the sessions directory, excluding '_default'."""
@@ -1572,6 +1627,20 @@ class ChatApp(App):
         self.command_history.append(user_message)
         self.history_index = len(self.command_history)
         chat_history.scroll_end()
+
+        # Check for shell mode (commands starting with '!')
+        if self._check_shell_mode(user_message):
+            # Execute shell command
+            self.is_loading = True
+            self.query_one(Input).placeholder = "Executing shell command..."
+
+            # Run shell command in a worker thread
+            self.agent_worker = self.run_worker(
+                partial(self._execute_shell_command, user_message),
+                thread=True,
+                name=f"Shell command: {user_message[:30]}",
+            )
+            return
 
         if user_message.startswith("/") and self._handle_command(user_message):
             return
@@ -1845,7 +1914,7 @@ class ChatApp(App):
                 server_configs = self.settings.get("mcpServers", {})
                 command_list = ["\n\n**Container Launch Commands:**\n"]
                 for name, config in server_configs.items():
-                    if config.get("disabled", False):
+                    if not config.get("enabled", True):
                         continue
                     command, args = self._wrap_command_for_container(name, config)
                     # Don't show unwrapped commands
@@ -2040,6 +2109,293 @@ class ChatApp(App):
                 return model
         return None
 
+    def _execute_shell_command(self, command: str) -> None:
+        """Executes a shell command in the persistent shell session and posts the response."""
+        import subprocess
+        import os
+        import shlex
+
+        try:
+            # Remove the leading '!' and strip whitespace
+            shell_command = command.lstrip().lstrip("!").strip()
+
+            if not shell_command:
+                self.post_message(
+                    self.ShellResponse("Error: No command provided after '!'")
+                )
+                return
+
+            # Check for exit command
+            if shell_command.lower() in ["exit", "quit"]:
+                # Reset shell session state
+                self.shell_working_dir = None
+                self.shell_env = None
+                self.shell_functions = {}
+                self.shell_aliases = {}
+                self.shell_options = {}
+                self._initialize_shell_session()
+                self.post_message(
+                    self.ShellResponse(
+                        "Shell session reset. A new session will be started on the next command."
+                    )
+                )
+                return
+
+            # Execute command with current shell state
+            try:
+                # Prepare command with state restoration
+                state_restore_commands = []
+
+                # Restore functions
+                for func_name, func_def in self.shell_functions.items():
+                    state_restore_commands.append(func_def)
+
+                # Restore aliases
+                for alias_name, alias_value in self.shell_aliases.items():
+                    state_restore_commands.append(f"alias {alias_name}='{alias_value}'")
+
+                # Restore shell options
+                for option, enabled in self.shell_options.items():
+                    if enabled:
+                        state_restore_commands.append(f"set {option}")
+
+                # Combine state restoration with the actual command
+                full_command = "\n".join(state_restore_commands + [shell_command])
+
+                result = subprocess.run(
+                    full_command,
+                    shell=True,
+                    capture_output=True,
+                    text=True,
+                    cwd=self.shell_working_dir,
+                    env=self.shell_env,
+                    timeout=30,
+                )
+
+                # Update working directory if cd command was executed
+                # Parse the command to detect cd commands more robustly
+                try:
+                    parsed_command = shlex.split(shell_command)
+                    if parsed_command and parsed_command[0] == "cd":
+                        if len(parsed_command) >= 2:
+                            new_dir = parsed_command[1]
+                            # Handle tilde expansion first, then relative paths
+                            new_dir = os.path.expanduser(new_dir)
+                            if not os.path.isabs(new_dir):
+                                new_dir = os.path.join(self.shell_working_dir, new_dir)
+                            # Resolve the path
+                            new_dir = os.path.abspath(new_dir)
+                            if os.path.exists(new_dir) and os.path.isdir(new_dir):
+                                self.shell_working_dir = new_dir
+                                logging.info(
+                                    f"Working directory changed to: {self.shell_working_dir}"
+                                )
+                        elif len(parsed_command) == 1:
+                            # cd without arguments - go to home directory
+                            home_dir = os.path.expanduser("~")
+                            if os.path.exists(home_dir) and os.path.isdir(home_dir):
+                                self.shell_working_dir = home_dir
+                                logging.info(
+                                    f"Working directory changed to: {self.shell_working_dir}"
+                                )
+                except Exception as e:
+                    logging.warning(f"Failed to update working directory: {e}")
+
+                # Format output in terminal-like style
+                output_parts = []
+
+                # Combine stdout and stderr in the order they would appear in a terminal
+                # Most commands don't produce stderr, so stdout first is usually correct
+                if result.stdout:
+                    output_parts.append(result.stdout.rstrip())
+
+                if result.stderr:
+                    # Add stderr after stdout (typical terminal behavior)
+                    if output_parts:
+                        output_parts.append("")  # Empty line separator
+                    output_parts.append(result.stderr.rstrip())
+
+                # Only show exit code if it's non-zero
+                if result.returncode != 0:
+                    if output_parts:
+                        output_parts.append("")  # Empty line separator
+                    output_parts.append(f"Exit code: {result.returncode}")
+
+                # Join all output parts
+                response = "\n".join(output_parts) if output_parts else ""
+
+                # Always post a response to ensure the UI is notified of completion
+                # Format as markdown code block to preserve newlines
+                if response:
+                    formatted_response = f"```\n{response}\n```"
+                    self.post_message(self.ShellResponse(formatted_response))
+                elif result.returncode != 0:
+                    # For non-zero exit codes with no output, show just the exit code
+                    formatted_response = f"```\nExit code: {result.returncode}\n```"
+                    self.post_message(self.ShellResponse(formatted_response))
+                else:
+                    # For successful commands with no output (like cd), post empty response
+                    self.post_message(self.ShellResponse(""))
+
+            except subprocess.TimeoutExpired:
+                self.post_message(
+                    self.ShellResponse("Command timed out after 30 seconds.")
+                )
+
+        except Exception as e:
+            self.post_message(self.ShellResponse(f"Error executing command: {e}"))
+
+    def _update_title_for_shell_mode(self, is_shell_mode: bool) -> None:
+        """Updates the app title to show current directory when in shell mode."""
+        import os
+
+        if is_shell_mode:
+            # Use shell working directory if available, otherwise current directory
+            current_dir = (
+                self.shell_working_dir if self.shell_working_dir else os.getcwd()
+            )
+            self.title = f"vibeagent - {current_dir}"
+        else:
+            # Restore the title with model ID
+            self.title = f"vibeagent ({self.model_id})"
+
+    def _check_shell_mode(self, text: str) -> bool:
+        """Checks if the input text indicates shell mode (starts with '!' after stripping whitespace)."""
+        return text.lstrip().startswith("!")
+
+    def _update_input_style_for_shell_mode(self, is_shell_mode: bool) -> None:
+        """Updates the input widget styling to indicate shell mode."""
+        input_widget = self.query_one(Input)
+        if is_shell_mode:
+            input_widget.add_class("shell-mode")
+        else:
+            input_widget.remove_class("shell-mode")
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        """Handles input changes to detect shell mode and update visual indicators."""
+        text = event.value
+        is_shell_mode = self._check_shell_mode(text)
+
+        # Update input styling
+        self._update_input_style_for_shell_mode(is_shell_mode)
+
+        # Update title for shell mode
+        self._update_title_for_shell_mode(is_shell_mode)
+
+    def _initialize_shell_session(self) -> None:
+        """Initializes the shell session with working directory and environment."""
+        import os
+        import subprocess
+
+        # Set initial working directory from allowedPaths if available
+        allowed_paths = self.settings.get("allowedPaths", [])
+        if allowed_paths:
+            initial_path = allowed_paths[0]
+            # Expand environment variables and user home directory
+            initial_path = os.path.expanduser(os.path.expandvars(initial_path))
+            if os.path.exists(initial_path) and os.path.isdir(initial_path):
+                self.shell_working_dir = initial_path
+            else:
+                self.shell_working_dir = os.getcwd()
+        else:
+            self.shell_working_dir = os.getcwd()
+
+        # Initialize environment with current environment
+        self.shell_env = os.environ.copy()
+
+        # Capture initial shell state
+        self._capture_shell_state()
+
+        logging.info(
+            f"Shell session initialized with working directory: {self.shell_working_dir}"
+        )
+
+    def _capture_shell_state(self) -> None:
+        """Captures current shell state including functions, aliases, and options."""
+        import subprocess
+
+        try:
+            # Capture functions
+            result = subprocess.run(
+                "declare -f",
+                shell=True,
+                capture_output=True,
+                text=True,
+                cwd=self.shell_working_dir,
+                env=self.shell_env,
+                timeout=10,
+            )
+            if result.returncode == 0:
+                # Parse function definitions
+                self.shell_functions = {}
+                lines = result.stdout.split("\n")
+                current_func = None
+                func_lines = []
+
+                for line in lines:
+                    if line.startswith("declare -f "):
+                        if current_func and func_lines:
+                            self.shell_functions[current_func] = "\n".join(func_lines)
+                        current_func = line.split(" ")[2]
+                        func_lines = [line]
+                    elif current_func and line.strip():
+                        func_lines.append(line)
+
+                if current_func and func_lines:
+                    self.shell_functions[current_func] = "\n".join(func_lines)
+
+            # Capture aliases
+            result = subprocess.run(
+                "alias",
+                shell=True,
+                capture_output=True,
+                text=True,
+                cwd=self.shell_working_dir,
+                env=self.shell_env,
+                timeout=10,
+            )
+            if result.returncode == 0:
+                self.shell_aliases = {}
+                for line in result.stdout.split("\n"):
+                    if line.startswith("alias "):
+                        # Parse alias definition
+                        parts = line.split("=", 1)
+                        if len(parts) == 2:
+                            alias_name = parts[0].split(" ")[1]
+                            alias_value = parts[1].strip("'\"")
+                            self.shell_aliases[alias_name] = alias_value
+
+            # Capture shell options
+            result = subprocess.run(
+                "set",
+                shell=True,
+                capture_output=True,
+                text=True,
+                cwd=self.shell_working_dir,
+                env=self.shell_env,
+                timeout=10,
+            )
+            if result.returncode == 0:
+                self.shell_options = {}
+                for line in result.stdout.split("\n"):
+                    if line.startswith("set "):
+                        # Parse set options
+                        options = line[4:].split()
+                        for opt in options:
+                            if opt.startswith("-") or opt.startswith("+"):
+                                self.shell_options[opt] = True
+
+            logging.info(
+                f"Captured shell state: {len(self.shell_functions)} functions, {len(self.shell_aliases)} aliases, {len(self.shell_options)} options"
+            )
+
+        except Exception as e:
+            logging.warning(f"Failed to capture shell state: {e}")
+            # Initialize empty state
+            self.shell_functions = {}
+            self.shell_aliases = {}
+            self.shell_options = {}
+
 
 # Embedded default settings
 DEFAULT_SETTINGS = {
@@ -2110,9 +2466,8 @@ DEFAULT_SETTINGS = {
         "playwright": {
             "command": "npx",
             "args": ["@executeautomation/playwright-mcp-server"],
-            "disabled": False,
             "autoApprove": [],
-            "enabled": True,
+            "enabled": False,
         },
         "wcgw": {
             "command": "uv",

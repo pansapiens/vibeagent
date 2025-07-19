@@ -40,6 +40,17 @@ vibeagent
 - `/dump-context [format]` - Display the agent's current memory. Format can be `markdown` (default) or `json`.
 - `/show-settings` - Displays the location of configuration files and their current content.
 
+### Shell Commands
+
+Commands starting with `!` are executed as shell commands in a pseudo-persistent shell session:
+
+- `!ls` - List files in the current directory
+- `!cd /path/to/directory` - Change directory
+- `!pwd` - Show current working directory
+- `!exit` - Exit the shell session (resets working directory and environment)
+
+The `!` shell session starts in the first path from `allowedPaths` in settings (default: `$HOME/ai_workspace`). The working directory, environment variables, shell functions, aliases, and shell options persist between commands
+
 ### Command Line Options
 
 - `--model MODEL` - Override the model to use (overrides settings.json and .env)
