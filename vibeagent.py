@@ -570,6 +570,10 @@ class ChatApp(App):
         self.sessions_dir = self.data_dir / "sessions"
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
 
+        # Auto-save functionality (will be initialized in on_mount)
+        self.auto_save_enabled = False
+        self.auto_save_session_name = None
+
         # Shell session management
         self.shell_working_dir = None
         self.shell_env = None
@@ -845,6 +849,24 @@ class ChatApp(App):
                 f"Error saving session: {e}", is_error=True, exc_info=True
             )
 
+    def _auto_save_session(self):
+        """Automatically saves the current session if auto-save is enabled."""
+        if not self.auto_save_enabled:
+            return
+
+        try:
+            path = self._get_session_path(self.auto_save_session_name)
+            path.parent.mkdir(parents=True, exist_ok=True)
+
+            session_data = self._create_session_data()
+
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(session_data, f, indent=2, cls=VibeAgentJSONEncoder)
+
+        except Exception as e:
+            # Don't display error messages for auto-save to avoid cluttering the UI
+            logging.error(f"Auto-save error: {e}", exc_info=True)
+
     def delete_session(self, name: str | None):
         """Deletes a saved session file."""
         if name is None:
@@ -983,6 +1005,13 @@ class ChatApp(App):
 
         # Initialize shell session
         self._initialize_shell_session()
+
+        # Initialize auto-save functionality
+        self.auto_save_enabled = self.settings.get("autoSave", True)
+        if self.auto_save_enabled:
+            # Generate auto-save session name with timestamp
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            self.auto_save_session_name = f"_autosave_{timestamp}"
 
         # provider = trace.get_tracer_provider()
         # provider.add_span_processor(SimpleSpanProcessor(self.TextualSpanExporter(self)))
@@ -1451,6 +1480,9 @@ class ChatApp(App):
         chat_history.mount(Markdown(response_text, classes="agent-message"))
         chat_history.scroll_end()
 
+        # Auto-save after agent response
+        self._auto_save_session()
+
     def on_chat_app_shell_response(self, message: ShellResponse) -> None:
         """Handles shell command responses."""
         # If the worker is None, it means the job was cancelled.
@@ -1472,6 +1504,9 @@ class ChatApp(App):
         if response_text.strip():
             chat_history.mount(Markdown(response_text, classes="agent-message"))
             chat_history.scroll_end()
+
+        # Auto-save after shell response
+        self._auto_save_session()
 
     def list_sessions(self) -> list[str]:
         """Lists available session files in the sessions directory, excluding '_default'."""
@@ -2661,6 +2696,7 @@ DEFAULT_SETTINGS = {
     "defaultModel": "mistralai/devstral-small:free",
     "contextLength": 16384,
     "contextManagementStrategy": "summarize",
+    "autoSave": True,
     "favoriteModels": [
         "mistralai/devstral-small:free",
         "mistralai/devstral-small",
