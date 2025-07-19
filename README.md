@@ -53,6 +53,48 @@ The `!` shell session starts in the first path from `allowedPaths` in settings (
 
 **Container Sandboxing**: When `containers.sandboxShell` is enabled in settings, shell commands run inside the configured container with `allowedPaths` mounted as volumes for isolation and security.
 
+#### Redirect Commands
+
+After executing a shell command, you can redirect its output to the LLM using these special commands:
+
+- `!>` - Redirect both stdout and stderr from the last command to the LLM
+- `!1>` - Redirect only stdout from the last command to the LLM
+- `!2>` - Redirect only stderr from the last command to the LLM
+
+You can also include a message with the redirect:
+
+```
+!> Please analyze this output
+!1> Check what files were found
+!2> Look at the error messages
+```
+
+The LLM will receive a formatted message including:
+- Your optional message (if provided)
+- The command that was executed
+- The relevant output (stdout/stderr based on the redirect type)
+- The exit code
+
+Example output sent to LLM:
+```
+Please analyze this output
+
+$ ls -la
+
+STDOUT:
+
+total 8
+drwxr-xr-x 2 user user 4096 Jan 1 12:00 .
+drwxr-xr-x 3 user user 4096 Jan 1 12:00 ..
+
+STDERR:
+
+ls: cannot access 'nonexistent': No such file or directory
+
+EXITCODE:
+1
+```
+
 ### Command Line Options
 
 - `--model MODEL` - Override the model to use (overrides settings.json and .env)

@@ -578,6 +578,12 @@ class ChatApp(App):
         self.shell_options = {}  # Store shell options
         self._initialize_shell_session()
 
+        # Last shell command tracking for redirect functionality
+        self.last_shell_command = None
+        self.last_shell_stdout = None
+        self.last_shell_stderr = None
+        self.last_shell_returncode = None
+
     def _is_phoenix_running(self) -> bool:
         import socket
         from urllib.parse import urlparse
@@ -1628,6 +1634,10 @@ class ChatApp(App):
         self.history_index = len(self.command_history)
         chat_history.scroll_end()
 
+        # Check for redirect commands first (!>, !1>, !2>)
+        if self._handle_redirect_command(user_message):
+            return
+
         # Check for shell mode (commands starting with '!')
         if self._check_shell_mode(user_message):
             # Execute shell command
@@ -2125,6 +2135,9 @@ class ChatApp(App):
                 )
                 return
 
+            # Store the command for potential redirect
+            self.last_shell_command = shell_command
+
             # Check for exit command
             if shell_command.lower() in ["exit", "quit"]:
                 # Reset shell session state
@@ -2186,6 +2199,12 @@ class ChatApp(App):
                         env=self.shell_env,
                         timeout=30,
                     )
+
+                    # Store command output for potential redirect
+                    self.last_shell_stdout = result.stdout
+                    self.last_shell_stderr = result.stderr
+                    self.last_shell_returncode = result.returncode
+
                 except FileNotFoundError:
                     if sandbox_shell:
                         self.post_message(
@@ -2533,6 +2552,90 @@ class ChatApp(App):
 
         logging.info(f"Wrapped shell command to run in Apptainer: {shell_command}")
         return apptainer_cmd, apptainer_args
+
+    def _handle_redirect_command(self, command: str) -> bool:
+        """
+        Handles redirect commands (!>, !1>, !2>) that send the last command's output to the LLM.
+        Returns True if a redirect command was handled, False otherwise.
+        """
+        # Check if the command starts with a redirect command
+        stripped_command = command.strip()
+        redirect_command = None
+
+        if stripped_command.startswith("!>"):
+            redirect_command = "!>"
+        elif stripped_command.startswith("!1>"):
+            redirect_command = "!1>"
+        elif stripped_command.startswith("!2>"):
+            redirect_command = "!2>"
+        else:
+            return False
+
+        if not self.last_shell_command:
+            self._display_ui_message(
+                "No previous shell command found to redirect.", is_error=True
+            )
+            return True
+
+        # Check if there's a user message after the redirect command
+        user_message = None
+        if len(stripped_command) > len(redirect_command):
+            # There's additional text after the redirect command
+            user_message = stripped_command[len(redirect_command) :].strip()
+
+        # Build the message to send to the LLM
+        message_parts = []
+
+        # Add user message if provided
+        if user_message:
+            message_parts.append(f"{user_message}\n")
+
+        # Add shell command and output
+        message_parts.append(f"$ {self.last_shell_command}\n")
+
+        if redirect_command == "!>" or redirect_command == "!1>":
+            # Include stdout
+            if self.last_shell_stdout:
+                message_parts.append("STDOUT:\n")
+                message_parts.append(f"{self.last_shell_stdout}\n")
+
+        if redirect_command == "!>" or redirect_command == "!2>":
+            # Include stderr
+            if self.last_shell_stderr:
+                message_parts.append("STDERR:\n")
+                message_parts.append(f"{self.last_shell_stderr}\n")
+
+        # Always include exit code
+        message_parts.append(f"EXITCODE: {str(self.last_shell_returncode)}\n")
+
+        # If no output was captured, indicate this
+        if len(message_parts) == (
+            3 if user_message else 2
+        ):  # Only command and exit code
+            message_parts.insert(-2, "(No output captured)")
+
+        # Send the message to the LLM
+        redirect_message = "\n".join(message_parts)
+
+        # Add the message to chat history
+        chat_history = self.query_one("#chat-history")
+        chat_history.mount(Static(f"> {command}", classes="user-message"))
+        chat_history.scroll_end()
+
+        # Send to LLM
+        self.is_loading = True
+        self.query_one(Input).placeholder = "Waiting for response..."
+
+        chat_history.mount(LoadingIndicator(classes="agent-thinking"))
+        chat_history.scroll_end()
+
+        self.agent_worker = self.run_worker(
+            partial(self.get_agent_response, redirect_message),
+            thread=True,
+            name=f"Redirect command: {redirect_command}",
+        )
+
+        return True
 
 
 # Embedded default settings
