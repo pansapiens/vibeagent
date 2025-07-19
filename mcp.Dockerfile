@@ -10,6 +10,27 @@ RUN apt-get update && \
     curl \
     gnupg \
     git \
+    file \
+    jq \
+    wget \
+    vim \
+    nano \
+    procps \
+    rsync \
+    tar \
+    zip \
+    unzip \
+    grep \
+    sed \
+    gawk \
+    netcat-openbsd \
+    iputils-ping \
+    dnsutils \
+    lsb-release \
+    build-essential \
+    pkg-config \
+    golang \
+    tree \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Node.js (LTS version) from NodeSource

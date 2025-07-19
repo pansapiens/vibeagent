@@ -131,15 +131,15 @@ After first run, a `settings.json` will be generated. You can edit this to add o
   - **macOS**: `~/Library/Logs/vibeagent/` ?
   - **Windows**: `C:\Users\<user>\AppData\Local\vibeagent\vibeagent\Logs\` ?
 
-### Model Configuration
+### Configuration file
 
-The model can be configured in multiple ways with the following priority (highest to lowest):
+The chat agent can be configured in multiple ways with the following priority (highest to lowest):
 
-1. **Command line arguments** (`--model`, `--api-key-env-var`, `--api-base`) - Overrides all other settings
+1. **Command line arguments** (eg `--model`, `--api-key-env-var`, `--api-base`) - Overrides all other settings
 2. **settings.json** - Model configuration in the settings file
 3. **Environment variables** - Fallback to .env file
 
-#### settings.json Model Configuration
+#### settings.json configuration files
 
 ```json
 {
@@ -177,6 +177,18 @@ The model can be configured in multiple ways with the following priority (highes
 - `defaultModel`: The model identifier to use on startup.
 - `favoriteModels`: A list of model IDs to show at the top of the `/model` selection list.
   - `containers`: Run MCP servers inside a container. `engine` can be `docker` or `apptainer`. `image` is the image to use. `sandboxShell` is whether to sandbox the `!` shell commands inside the container (requires `enabled: true`).
+
+## Docker and apptainer container wrappers
+
+Typical MCP servers can be run in a container to help restrict their access to the host filesystem. This is only a weak form of sandboxing, but better than nothing.
+
+A Dockerfile `mcp.Dockerfile` is provided to build a container image that is typically compatible with most MCP servers. To build the image:
+
+```bash
+docker build -t vibeagent-mcp:latest -f mcp.Dockerfile .
+```
+
+Apptainer uses the same image via `docker://`.
 
 ##  Monitoring the agent, telemetry
 
