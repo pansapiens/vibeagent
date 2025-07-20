@@ -1,6 +1,7 @@
 # Changelog
 
 All notable changes to this project will be documented in this file.
+- **Command history navigation**: Cursor now automatically moves to the end of input text when navigating through command history with up/down arrows
 
 ## [0.1.0] - 2025-07-19
 

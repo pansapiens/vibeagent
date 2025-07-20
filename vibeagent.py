@@ -2009,16 +2009,24 @@ class ChatApp(App):
         """Go to the previous command in history."""
         if self.history_index > 0:
             self.history_index -= 1
-            self.query_one(Input).value = self.command_history[self.history_index]
+            input_widget = self.query_one(Input)
+            input_widget.value = self.command_history[self.history_index]
+            # Set cursor to the end of the input text
+            input_widget.cursor_position = len(input_widget.value)
 
     def action_history_next(self) -> None:
         """Go to the next command in history."""
+        input_widget = self.query_one(Input)
         if self.history_index < len(self.command_history) - 1:
             self.history_index += 1
-            self.query_one(Input).value = self.command_history[self.history_index]
+            input_widget.value = self.command_history[self.history_index]
+            # Set cursor to the end of the input text
+            input_widget.cursor_position = len(input_widget.value)
         elif self.history_index == len(self.command_history) - 1:
             self.history_index += 1
-            self.query_one(Input).value = ""
+            input_widget.value = ""
+            # Set cursor to the beginning when clearing
+            input_widget.cursor_position = 0
 
     def action_scroll_up(self) -> None:
         """Scroll the chat history up."""
