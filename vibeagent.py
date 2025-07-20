@@ -829,6 +829,7 @@ class ChatApp(App):
             },
             "ui_history": self._capture_ui_history(),
             "agent_memory_steps": self._capture_agent_memory(),
+            "command_history": self.command_history,
         }
 
     def save_session(self, name: str | None):
@@ -907,6 +908,9 @@ class ChatApp(App):
             # Restore UI
             self._restore_ui_history(session_data.get("ui_history", []))
 
+            # Restore command history
+            self._restore_command_history(session_data.get("command_history", []))
+
             # Restore model if different
             model_id = session_data.get("metadata", {}).get("model_id")
             if model_id and model_id != self.model_id:
@@ -924,6 +928,11 @@ class ChatApp(App):
                 from_thread=True,
                 exc_info=True,
             )
+
+    def _restore_command_history(self, command_history: list[str]) -> None:
+        """Restores the command history from session data."""
+        self.command_history = command_history
+        self.history_index = len(self.command_history)
 
     async def fetch_models(self) -> None:
         """Fetches available models from all enabled OpenAI-compatible endpoints."""

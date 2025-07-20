@@ -5,6 +5,7 @@ All notable changes to this project will be documented in this file.
 ## [0.1.0] - 2025-07-19
 
 ### Added
+- **Command history persistence**: User's typed command history is now saved and restored with sessions, enabling up/down arrow navigation after `/load`
 - **GitHub Actions**: Automated Docker image builds and publishing to GitHub Package Registry
 - **Container image management**: Automatic checking and pulling of Docker/Apptainer images before starting MCP servers
 - **Session management**: `/save`, `/load`, `/delete` commands for managing chat sessions
@@ -37,7 +38,7 @@ All notable changes to this project will be documented in this file.
 - **UI improvements**: Better loading indicators and internal CSS handling
 - **Session saving**: Auto-save sessions are named with timestamp format: `_autosave_YYYYMMDD_HHMMSS.json`
 - **Auto-save errors**: Logged but don't display UI messages to avoid cluttering the interface
-- **Context compression**: Improved summarization compression algorithm
+- **Context compression**: Improved summarization compression algorithm with better token counting and error handling
 - **Error messages**: Refactored to display in UI and logs consistently
 
 ### Fixed
@@ -46,6 +47,7 @@ All notable changes to this project will be documented in this file.
 - **Agent response errors**: Improved error handling to ensure UI updates properly
 - **Aider tool**: Fixed integration with aider tool
 - **Endpoint defaults**: Endpoint enabled setting defaults to true if missing
+- **Compress summarize**: Fixed issue where context appeared empty after using `/compress summarize` command
 
 ### Technical
 - **Dependencies**: Added textual-autocomplete, platformdirs, and other required packages
