@@ -160,6 +160,10 @@ The chat agent can be configured in multiple ways with the following priority (h
     "mistralai/devstral-small:free",
     "google/gemma-3n-e4b-it"
   ],
+  "allowCurrentDirectory": true,
+  "allowedPaths": [
+    "$HOME/ai_workspace"
+  ],
   "containers": {
       "enabled": false,
       "engine": "docker",
@@ -176,7 +180,9 @@ The chat agent can be configured in multiple ways with the following priority (h
   - `enabled`: Set to `true` to use this endpoint. This is optional and defaults to `true`.
 - `defaultModel`: The model identifier to use on startup.
 - `favoriteModels`: A list of model IDs to show at the top of the `/model` selection list.
-  - `containers`: Run MCP servers inside a container. `engine` can be `docker` or `apptainer`. `image` is the image to use. `sandboxShell` is whether to sandbox the `!` shell commands inside the container (requires `enabled: true`).
+- `allowCurrentDirectory`: When `true` (default), automatically adds the directory where vibeagent is started to the beginning of `allowedPaths`. Set to `false` to disable this behavior.
+- `allowedPaths`: A list of directories that vibeagent can access. The shell session starts in the first path in this list. Environment variables are supported (e.g., `$HOME/ai_workspace`).
+- `containers`: Run MCP servers inside a container. `engine` can be `docker` or `apptainer`. `image` is the image to use. `sandboxShell` is whether to sandbox the `!` shell commands inside the container (requires `enabled: true`).
 
 ## Docker and apptainer container wrappers
 

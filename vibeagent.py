@@ -2970,6 +2970,7 @@ DEFAULT_SETTINGS = {
     "contextLength": 16384,
     "contextManagementStrategy": "summarize",
     "autoSave": True,
+    "allowCurrentDirectory": True,
     "favoriteModels": [
         "mistralai/devstral-small:free",
         "mistralai/devstral-small",
@@ -3087,6 +3088,19 @@ def main():
                         return data
 
                 config = _substitute_env_vars(config)
+
+                # Add current directory to allowedPaths if allowCurrentDirectory is True
+                if config.get("allowCurrentDirectory", True):
+                    current_dir = os.getcwd()
+                    allowed_paths = config.get("allowedPaths", [])
+                    if current_dir not in allowed_paths:
+                        # Insert current directory at the beginning of allowedPaths
+                        allowed_paths.insert(0, current_dir)
+                        config["allowedPaths"] = allowed_paths
+                        logging.info(
+                            f"Added current directory to allowedPaths: {current_dir}"
+                        )
+
                 if isinstance(config, dict):
                     return config
                 else:
