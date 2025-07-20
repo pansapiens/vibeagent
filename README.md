@@ -24,7 +24,7 @@ uvx --from git+https://github.com/pansapiens/vibeagent vibeagent
 If you've like to install it so you have the `vibeagent` command available:
 
 ```bash
-pip install git+https://github.com/pansapiens/vibeagent
+pip install -U git+https://github.com/pansapiens/vibeagent
 
 # Then run:
 vibeagent
