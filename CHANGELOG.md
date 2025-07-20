@@ -1,7 +1,22 @@
 # Changelog
 
 All notable changes to this project will be documented in this file.
-- **Command history navigation**: Cursor now automatically moves to the end of input text when navigating through command history with up/down arrows
+
+## [0.1.1] - 2025-01-XX
+
+### Added
+- **Shell state persistence**: Complete shell state (working directory, environment variables, functions, aliases) is now maintained between `!` commands
+- **Working directory management**: Current directory is automatically set to first allowed path on startup and persists across shell commands
+- **Container support**: Docker/Apptainer containers now preserve shell state via `/tmp` volume mounts
+
+### Changed
+- **Shell architecture**: Refactored shell functionality into dedicated `ShellSession` class for better state management
+- **Default settings**: Added `"allowCurrentDirectory": true` to automatically include startup directory in allowed paths
+
+### Fixed
+- **Shell state persistence**: Fixed issues where working directory, environment variables, functions, and aliases were not properly maintained between `!` commands
+- **State capture format**: Updated to use `###! SECTION !###` format for better reliability
+- **Tilde expansion**: Fixed issue where `~` was not expanded to home directory in shell commands
 
 ## [0.1.0] - 2025-07-19
 

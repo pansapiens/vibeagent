@@ -21,7 +21,7 @@ import time
 import random
 import string
 import shlex
-import datetime
+from datetime import datetime
 from functools import partial
 from pathlib import Path
 from dotenv import load_dotenv
@@ -52,6 +52,7 @@ from textual.worker import Worker, WorkerState
 from textual_autocomplete import AutoComplete, DropdownItem
 from textual_autocomplete._autocomplete import TargetState
 from smolagents.memory import ActionStep, MemoryStep, TaskStep
+import uuid
 
 
 try:
@@ -575,18 +576,8 @@ class ChatApp(App):
         self.auto_save_session_name = None
 
         # Shell session management
-        self.shell_working_dir = None
-        self.shell_env = None
-        self.shell_functions = {}  # Store function definitions
-        self.shell_aliases = {}  # Store aliases
-        self.shell_options = {}  # Store shell options
-        self._initialize_shell_session()
-
-        # Last shell command tracking for redirect functionality
-        self.last_shell_command = None
-        self.last_shell_stdout = None
-        self.last_shell_stderr = None
-        self.last_shell_returncode = None
+        # Initialize shell session
+        self.shell_session = ShellSession(self.settings)
 
     def _is_phoenix_running(self) -> bool:
         import socket
@@ -824,7 +815,7 @@ class ChatApp(App):
         return {
             "metadata": {
                 "version": 1,
-                "timestamp": datetime.datetime.now().isoformat(),
+                "timestamp": datetime.now().isoformat(),
                 "model_id": self.model_id,
             },
             "ui_history": self._capture_ui_history(),
@@ -1013,13 +1004,13 @@ class ChatApp(App):
         self._update_input_style_for_shell_mode(False)
 
         # Initialize shell session
-        self._initialize_shell_session()
+        self.shell_session = ShellSession(self.settings)
 
         # Initialize auto-save functionality
         self.auto_save_enabled = self.settings.get("autoSave", True)
         if self.auto_save_enabled:
             # Generate auto-save session name with timestamp
-            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             self.auto_save_session_name = f"_autosave_{timestamp}"
 
         # provider = trace.get_tracer_provider()
@@ -1666,7 +1657,29 @@ class ChatApp(App):
         if self.agent:
             try:
                 allowed_paths = self.settings.get("allowedPaths", [])
-                current_dir = os.getcwd()
+
+                # Use shell command pwd to get current working directory
+                import subprocess
+
+                try:
+                    result = subprocess.run(
+                        ["pwd"],
+                        capture_output=True,
+                        text=True,
+                        cwd=(
+                            self.shell_working_dir
+                            if hasattr(self, "shell_working_dir")
+                            else None
+                        ),
+                        timeout=5,
+                    )
+                    if result.returncode == 0:
+                        current_dir = result.stdout.strip()
+                    else:
+                        current_dir = os.getcwd()  # Fallback to os.getcwd()
+                except Exception:
+                    current_dir = os.getcwd()  # Fallback to os.getcwd()
+
                 context_dict = {
                     "allowedPaths": ", ".join(allowed_paths),
                     "pwd": current_dir,
@@ -2429,214 +2442,60 @@ class ChatApp(App):
 
     def _execute_shell_command(self, command: str) -> None:
         """Executes a shell command in the persistent shell session and posts the response."""
-        import subprocess
-        import os
-        import shlex
-
         try:
-            # Remove the leading '!' and strip whitespace
-            shell_command = command.lstrip().lstrip("!").strip()
+            # Execute command using shell session
+            stdout, stderr, returncode = self.shell_session.execute_command(command)
 
-            if not shell_command:
-                self.post_message(
-                    self.ShellResponse("Error: No command provided after '!'")
-                )
-                return
+            # Store command info for redirect functionality
+            last_cmd, last_stdout, last_stderr, last_rc = (
+                self.shell_session.get_last_command_info()
+            )
+            self.last_shell_command = last_cmd
+            self.last_shell_stdout = last_stdout
+            self.last_shell_stderr = last_stderr
+            self.last_shell_returncode = last_rc
 
-            # Store the command for potential redirect
-            self.last_shell_command = shell_command
+            # Format response
+            response_parts = []
 
-            # Check for exit command
-            if shell_command.lower() in ["exit", "quit"]:
-                # Reset shell session state
-                self.shell_working_dir = None
-                self.shell_env = None
-                self.shell_functions = {}
-                self.shell_aliases = {}
-                self.shell_options = {}
-                self._initialize_shell_session()
-                self.post_message(
-                    self.ShellResponse(
-                        "Shell session reset. A new session will be started on the next command."
-                    )
-                )
-                return
+            if stdout:
+                response_parts.append(stdout)
 
-            # Execute command with current shell state
-            try:
-                # Prepare command with state restoration
-                state_restore_commands = []
-
-                # Restore functions
-                for func_name, func_def in self.shell_functions.items():
-                    state_restore_commands.append(func_def)
-
-                # Restore aliases
-                for alias_name, alias_value in self.shell_aliases.items():
-                    state_restore_commands.append(f"alias {alias_name}='{alias_value}'")
-
-                # Restore shell options
-                for option, enabled in self.shell_options.items():
-                    if enabled:
-                        state_restore_commands.append(f"set {option}")
-
-                # Combine state restoration with the actual command
-                full_command = "\n".join(state_restore_commands + [shell_command])
-
-                # Check if we need to sandbox the shell
-                container_settings = self.settings.get("containers", {})
-                sandbox_shell = container_settings.get("sandboxShell", False)
-
-                if sandbox_shell:
-                    executable, args = self._wrap_shell_command_for_container(
-                        full_command
-                    )
-                    command_to_run = [executable] + args
-                else:
-                    # For non-sandboxed shells, use the full command as a string
-                    command_to_run = full_command
-
-                try:
-                    result = subprocess.run(
-                        command_to_run,
-                        # Use shell=True for non-sandboxed (string command), shell=False for sandboxed (list command)
-                        shell=not sandbox_shell,
-                        capture_output=True,
-                        text=True,
-                        cwd=self.shell_working_dir if not sandbox_shell else None,
-                        env=self.shell_env,
-                        timeout=30,
-                    )
-
-                    # Store command output for potential redirect
-                    self.last_shell_stdout = result.stdout
-                    self.last_shell_stderr = result.stderr
-                    self.last_shell_returncode = result.returncode
-
-                except FileNotFoundError:
-                    if sandbox_shell:
-                        self.post_message(
-                            self.ShellResponse(
-                                f"Error: Container engine '{container_settings.get('engine', 'docker')}' not found. Please ensure it is installed and in your PATH."
-                            )
-                        )
-                        return
-                    else:
-                        raise
-
-                # Update working directory if cd command was executed
-                # This only makes sense for non-sandboxed shells.
-                # For sandboxed, the state is ephemeral inside the container for each command.
-                if not sandbox_shell:
-                    try:
-                        parsed_command = shlex.split(shell_command)
-                        if parsed_command and parsed_command[0] == "cd":
-                            if len(parsed_command) >= 2:
-                                new_dir = parsed_command[1]
-                                # Handle tilde expansion first, then relative paths
-                                new_dir = os.path.expanduser(new_dir)
-                                if not os.path.isabs(new_dir):
-                                    new_dir = os.path.join(
-                                        self.shell_working_dir, new_dir
-                                    )
-                                # Resolve the path
-                                new_dir = os.path.abspath(new_dir)
-                                if os.path.exists(new_dir) and os.path.isdir(new_dir):
-                                    self.shell_working_dir = new_dir
-                                    logging.info(
-                                        f"Working directory changed to: {self.shell_working_dir}"
-                                    )
-                            elif len(parsed_command) == 1:
-                                # cd without arguments - go to home directory
-                                home_dir = os.path.expanduser("~")
-                                if os.path.exists(home_dir) and os.path.isdir(home_dir):
-                                    self.shell_working_dir = home_dir
-                                    logging.info(
-                                        f"Working directory changed to: {self.shell_working_dir}"
-                                    )
-                    except Exception as e:
-                        logging.warning(f"Failed to update working directory: {e}")
-
-                # Format output in terminal-like style
-                output_parts = []
-
-                # Combine stdout and stderr in the order they would appear in a terminal
-                # Most commands don't produce stderr, so stdout first is usually correct
-                if result.stdout:
-                    output_parts.append(result.stdout.rstrip())
-
-                if result.stderr:
-                    # Add stderr after stdout (typical terminal behavior)
-                    if output_parts:
-                        output_parts.append("")  # Empty line separator
-                    output_parts.append(result.stderr.rstrip())
+            if stderr:
+                if response_parts:
+                    response_parts.append("")  # Empty line separator
+                response_parts.append(stderr)
 
                 # Only show exit code if it's non-zero
-                if result.returncode != 0:
-                    if output_parts:
-                        output_parts.append("")  # Empty line separator
-                    output_parts.append(f"Exit code: {result.returncode}")
+            if returncode != 0:
+                if response_parts:
+                    response_parts.append("")  # Empty line separator
+                response_parts.append(f"Exit code: {returncode}")
 
-                # Join all output parts
-                response = "\n".join(output_parts) if output_parts else ""
+            # Join all response parts
+            response = "\n".join(response_parts) if response_parts else ""
 
-                # Always post a response to ensure the UI is notified of completion
-                # Format as markdown code block to preserve newlines
-                if response:
-                    formatted_response = f"```\n{response}\n```"
-                    self.post_message(self.ShellResponse(formatted_response))
-                elif result.returncode != 0:
-                    # For non-zero exit codes with no output, show just the exit code
-                    formatted_response = f"```\nExit code: {result.returncode}\n```"
-                    self.post_message(self.ShellResponse(formatted_response))
-                else:
-                    # For successful commands with no output (like cd), post empty response
-                    self.post_message(self.ShellResponse(""))
-
-            except subprocess.TimeoutExpired:
-                self.post_message(
-                    self.ShellResponse("Command timed out after 30 seconds.")
-                )
+            # Always post a response to ensure the UI is notified of completion
+            # Format as markdown code block to preserve newlines
+            if response:
+                formatted_response = f"```\n{response}\n```"
+                self.post_message(self.ShellResponse(formatted_response))
+            elif returncode != 0:
+                # For non-zero exit codes with no output, show just the exit code
+                formatted_response = f"```\nExit code: {returncode}\n```"
+                self.post_message(self.ShellResponse(formatted_response))
+            else:
+                # For successful commands with no output (like cd), post empty response
+                self.post_message(self.ShellResponse(""))
 
         except Exception as e:
             self.post_message(self.ShellResponse(f"Error executing command: {e}"))
 
-    def _wrap_shell_command_for_container(
-        self, shell_command: str
-    ) -> tuple[str, list[str]]:
-        """Wraps a shell command to be run inside a container."""
-        container_settings = self.settings.get("containers", {})
-        engine = container_settings.get("engine", "docker")
-
-        # The command to run inside the container is bash
-        command = "bash"
-        # The argument to bash is the shell command itself
-        args = ["-c", shell_command]
-
-        if engine == "docker":
-            return self._wrap_shell_command_for_docker(
-                shell_command, container_settings
-            )
-        elif engine == "apptainer":
-            return self._wrap_shell_command_for_apptainer(
-                shell_command, container_settings
-            )
-        else:
-            # Should not happen if settings are validated, but as a fallback
-            logging.warning(
-                f"Container engine '{engine}' not supported for sandboxed shell. Running on host."
-            )
-            return command, args
-
     def _update_title_for_shell_mode(self, is_shell_mode: bool) -> None:
         """Updates the app title to show current directory when in shell mode."""
-        import os
-
         if is_shell_mode:
-            # Use shell working directory if available, otherwise current directory
-            current_dir = (
-                self.shell_working_dir if self.shell_working_dir else os.getcwd()
-            )
+            # Use shell working directory from shell session
+            current_dir = self.shell_session.get_working_directory()
             self.title = f"vibeagent - {current_dir}"
         else:
             # Restore the title with model ID
@@ -2664,202 +2523,6 @@ class ChatApp(App):
 
         # Update title for shell mode
         self._update_title_for_shell_mode(is_shell_mode)
-
-    def _initialize_shell_session(self) -> None:
-        """Initializes the shell session with working directory and environment."""
-        import os
-        import subprocess
-
-        # Set initial working directory from allowedPaths if available
-        allowed_paths = self.settings.get("allowedPaths", [])
-        if allowed_paths:
-            initial_path = allowed_paths[0]
-            # Expand environment variables and user home directory
-            initial_path = os.path.expanduser(os.path.expandvars(initial_path))
-            if os.path.exists(initial_path) and os.path.isdir(initial_path):
-                self.shell_working_dir = initial_path
-            else:
-                self.shell_working_dir = os.getcwd()
-        else:
-            self.shell_working_dir = os.getcwd()
-
-        # Initialize environment with current environment
-        self.shell_env = os.environ.copy()
-
-        # Capture initial shell state
-        self._capture_shell_state()
-
-        logging.info(
-            f"Shell session initialized with working directory: {self.shell_working_dir}"
-        )
-
-    def _capture_shell_state(self) -> None:
-        """Captures current shell state including functions, aliases, and options."""
-        import subprocess
-
-        try:
-            # Capture functions
-            result = subprocess.run(
-                "declare -f",
-                shell=True,
-                capture_output=True,
-                text=True,
-                cwd=self.shell_working_dir,
-                env=self.shell_env,
-                timeout=10,
-            )
-            if result.returncode == 0:
-                # Parse function definitions
-                self.shell_functions = {}
-                lines = result.stdout.split("\n")
-                current_func = None
-                func_lines = []
-
-                for line in lines:
-                    if line.startswith("declare -f "):
-                        if current_func and func_lines:
-                            self.shell_functions[current_func] = "\n".join(func_lines)
-                        current_func = line.split(" ")[2]
-                        func_lines = [line]
-                    elif current_func and line.strip():
-                        func_lines.append(line)
-
-                if current_func and func_lines:
-                    self.shell_functions[current_func] = "\n".join(func_lines)
-
-            # Capture aliases
-            result = subprocess.run(
-                "alias",
-                shell=True,
-                capture_output=True,
-                text=True,
-                cwd=self.shell_working_dir,
-                env=self.shell_env,
-                timeout=10,
-            )
-            if result.returncode == 0:
-                self.shell_aliases = {}
-                for line in result.stdout.split("\n"):
-                    if line.startswith("alias "):
-                        # Parse alias definition
-                        parts = line.split("=", 1)
-                        if len(parts) == 2:
-                            alias_name = parts[0].split(" ")[1]
-                            alias_value = parts[1].strip("'\"")
-                            self.shell_aliases[alias_name] = alias_value
-
-            # Capture shell options
-            result = subprocess.run(
-                "set",
-                shell=True,
-                capture_output=True,
-                text=True,
-                cwd=self.shell_working_dir,
-                env=self.shell_env,
-                timeout=10,
-            )
-            if result.returncode == 0:
-                self.shell_options = {}
-                for line in result.stdout.split("\n"):
-                    if line.startswith("set "):
-                        # Parse set options
-                        options = line[4:].split()
-                        for opt in options:
-                            if opt.startswith("-") or opt.startswith("+"):
-                                self.shell_options[opt] = True
-
-            logging.info(
-                f"Captured shell state: {len(self.shell_functions)} functions, {len(self.shell_aliases)} aliases, {len(self.shell_options)} options"
-            )
-
-        except Exception as e:
-            logging.warning(f"Failed to capture shell state: {e}")
-            # Initialize empty state
-            self.shell_functions = {}
-            self.shell_aliases = {}
-            self.shell_options = {}
-
-    def _wrap_shell_command_for_docker(
-        self, shell_command: str, container_settings: dict
-    ) -> tuple[str, list[str]]:
-        """Wraps a shell command to be run inside a Docker container."""
-        image = container_settings.get("image")
-        home_mount_point = container_settings.get("home_mount_point")
-
-        docker_cmd = "docker"
-        docker_args = [
-            "run",
-            "--rm",
-            "-i",
-        ]  # Run, remove on exit, and interactive for stdin
-
-        # Match host user UID/GID to avoid permission issues
-        if sys.platform in ["linux", "darwin"]:
-            uid = os.getuid()
-            gid = os.getgid()
-            docker_args.extend(["--user", f"{uid}:{gid}"])
-
-        # Mount allowedPaths read-write
-        allowed_paths = self.settings.get("allowedPaths", [])
-        resolved_workdir = None
-        for path_str in allowed_paths:
-            path = Path(path_str).resolve()
-            if path.exists():
-                docker_args.extend(["-v", f"{path}:{path}:rw"])
-                if (
-                    resolved_workdir is None
-                ):  # Set workdir to the first valid allowed path
-                    resolved_workdir = path
-
-        # Set workdir. If no allowed paths, use home directory inside container
-        if resolved_workdir:
-            docker_args.extend(["--workdir", str(resolved_workdir)])
-        else:
-            docker_args.extend(["--workdir", home_mount_point])
-
-        # The container image to use
-        docker_args.append(image)
-
-        # The shell command to run inside the container
-        docker_args.append("bash")
-        docker_args.extend(["-c", shell_command])
-
-        logging.info(f"Wrapped shell command to run in Docker: {shell_command}")
-        return docker_cmd, docker_args
-
-    def _wrap_shell_command_for_apptainer(
-        self, shell_command: str, container_settings: dict
-    ) -> tuple[str, list[str]]:
-        """Wraps a shell command to be run inside an Apptainer container."""
-        image = container_settings.get("image")
-        home_mount_point = container_settings.get("home_mount_point")
-
-        apptainer_cmd = "apptainer"
-        apptainer_args = ["run", "--cleanenv"]  # --cleanenv for better isolation
-
-        # Mount allowedPaths read-write
-        allowed_paths = self.settings.get("allowedPaths", [])
-        resolved_workdir = None
-        for path_str in allowed_paths:
-            path = Path(path_str).resolve()
-            if path.exists():
-                apptainer_args.extend(["--bind", f"{path}:{path}:rw"])
-                if resolved_workdir is None:  # Set workdir to first valid path
-                    resolved_workdir = path
-
-        # Set workdir
-        if resolved_workdir:
-            apptainer_args.extend(["--pwd", str(resolved_workdir)])
-
-        # Image URI must be specified for Apptainer
-        apptainer_args.append(f"docker://{image}")
-
-        # The shell command to run inside the container
-        apptainer_args.append("bash")
-        apptainer_args.extend(["-c", shell_command])
-
-        logging.info(f"Wrapped shell command to run in Apptainer: {shell_command}")
-        return apptainer_cmd, apptainer_args
 
     def _handle_redirect_command(self, command: str) -> bool:
         """
@@ -2983,7 +2646,7 @@ DEFAULT_SETTINGS = {
         "engine": "docker",
         "image": "ghcr.io/pansapiens/vibeagent-mcp:latest",
         "home_mount_point": "/home/agent",
-        "sandboxShell": False,
+        "sandboxBangShellCommands": False,
     },
     "mcpServers": {
         "filesystem": {
@@ -3034,6 +2697,708 @@ DEFAULT_SETTINGS = {
         },
     },
 }
+
+
+class ShellSession:
+    """Manages a persistent shell session with state capture and restoration."""
+
+    def __init__(self, settings: dict):
+        """Initialize the shell session with settings."""
+        self.settings = settings
+        self.working_dir = None
+        self.env = None
+        self.functions = {}  # Store function definitions
+        self.aliases = {}  # Store aliases
+        self.options = {}  # Store shell options
+
+        # Last command state for redirect functionality
+        self.last_command = None
+        self.last_stdout = None
+        self.last_stderr = None
+        self.last_returncode = None
+
+        # Initialize the session
+        self._initialize_session()
+
+    def _initialize_session(self) -> None:
+        """Initializes the shell session with working directory and environment."""
+        import os
+
+        # Set initial working directory from allowedPaths if available
+        allowed_paths = self.settings.get("allowedPaths", [])
+        if allowed_paths:
+            initial_path = allowed_paths[0]
+            # Expand environment variables and user home directory
+            initial_path = os.path.expanduser(os.path.expandvars(initial_path))
+            if os.path.exists(initial_path) and os.path.isdir(initial_path):
+                self.working_dir = initial_path
+                # Change the actual working directory to the first allowed path
+                try:
+                    os.chdir(initial_path)
+                    logging.info(f"Changed working directory to: {initial_path}")
+                except Exception as e:
+                    logging.warning(
+                        f"Failed to change working directory to {initial_path}: {e}"
+                    )
+            else:
+                self.working_dir = os.getcwd()
+        else:
+            self.working_dir = os.getcwd()
+
+        # Initialize environment with current environment
+        self.env = os.environ.copy()
+
+        # Capture initial shell state
+        self._capture_state()
+
+        logging.info(
+            f"Shell session initialized with working directory: {self.working_dir}"
+        )
+
+    def _capture_state(self) -> None:
+        """Captures current shell state including functions, aliases, and options."""
+        import subprocess
+
+        try:
+            # Capture functions
+            result = subprocess.run(
+                "declare -f",
+                shell=True,
+                capture_output=True,
+                text=True,
+                cwd=self.working_dir,
+                env=self.env,
+                timeout=10,
+            )
+            if result.returncode == 0:
+                # Parse function definitions
+                self.functions = {}
+                lines = result.stdout.split("\n")
+                current_func = None
+                func_lines = []
+
+                for line in lines:
+                    if line.startswith("declare -f "):
+                        if current_func and func_lines:
+                            self.functions[current_func] = "\n".join(func_lines)
+                        current_func = line.split(" ")[2]
+                        func_lines = [line]
+                    elif current_func and line.strip():
+                        func_lines.append(line)
+
+                if current_func and func_lines:
+                    self.functions[current_func] = "\n".join(func_lines)
+
+            # Capture aliases
+            result = subprocess.run(
+                "alias",
+                shell=True,
+                capture_output=True,
+                text=True,
+                cwd=self.working_dir,
+                env=self.env,
+                timeout=10,
+            )
+            if result.returncode == 0:
+                self.aliases = {}
+                for line in result.stdout.split("\n"):
+                    if line.startswith("alias "):
+                        # Parse alias definition
+                        parts = line.split("=", 1)
+                        if len(parts) == 2:
+                            alias_name = parts[0].split(" ")[1]
+                            alias_value = parts[1].strip("'\"")
+                            self.aliases[alias_name] = alias_value
+
+            # Capture shell options
+            result = subprocess.run(
+                "set",
+                shell=True,
+                capture_output=True,
+                text=True,
+                cwd=self.working_dir,
+                env=self.env,
+                timeout=10,
+            )
+            if result.returncode == 0:
+                self.options = {}
+                for line in result.stdout.split("\n"):
+                    if line.startswith("set "):
+                        # Parse set options
+                        options = line[4:].split()
+                        for opt in options:
+                            if opt.startswith("-") or opt.startswith("+"):
+                                self.options[opt] = True
+
+            logging.info(
+                f"Captured shell state: {len(self.functions)} functions, {len(self.aliases)} aliases, {len(self.options)} options"
+            )
+
+        except Exception as e:
+            logging.warning(f"Failed to capture shell state: {e}")
+            # Initialize empty state
+            self.functions = {}
+            self.aliases = {}
+            self.options = {}
+
+    def _create_state_file_path(self) -> Path:
+        """Creates a unique state file path in /tmp to prevent race conditions."""
+        import tempfile
+
+        # Create a unique filename using process ID and UUID
+        unique_id = f"vibeagent_shell_state_{os.getpid()}_{uuid.uuid4().hex[:8]}"
+        return Path("/tmp") / unique_id
+
+    def _generate_state_capture_commands(self, state_file_path: Path) -> str:
+        """Generates shell commands to capture the complete shell state to a file."""
+        # Create a comprehensive state capture script
+        state_capture_script = f"""#!/bin/bash
+# Capture complete shell state to {state_file_path}
+
+# Create the state file with proper permissions
+touch "{state_file_path}"
+chmod 600 "{state_file_path}"
+
+# Capture functions
+echo "###! FUNCTIONS !###" >> "{state_file_path}"
+declare -f >> "{state_file_path}" 2>/dev/null || true
+
+# Capture aliases
+echo "###! ALIASES !###" >> "{state_file_path}"
+alias >> "{state_file_path}" 2>/dev/null || true
+
+# Capture shell options (but exclude variables that might contain our markers)
+echo "###! SHELL_OPTIONS !###" >> "{state_file_path}"
+set | grep -v "BASH_EXECUTION_STRING" | grep -v "###!" >> "{state_file_path}" 2>/dev/null || true
+
+# Capture environment variables
+echo "###! ENVIRONMENT !###" >> "{state_file_path}"
+env >> "{state_file_path}" 2>/dev/null || true
+
+# Capture working directory
+echo "###! WORKING_DIRECTORY !###" >> "{state_file_path}"
+pwd >> "{state_file_path}" 2>/dev/null || true
+
+# Capture exit code (will be set after command execution)
+echo "###! EXIT_CODE !###" >> "{state_file_path}"
+echo "$?" >> "{state_file_path}"
+
+# Ensure the file is written
+sync "{state_file_path}"
+"""
+        return state_capture_script
+
+    def _parse_state_file(self, state_file_path: Path) -> dict:
+        """Parses the state file and returns a dictionary with all captured state."""
+        state = {
+            "functions": {},
+            "aliases": {},
+            "shell_options": {},
+            "environment": {},
+            "working_directory": None,
+            "exit_code": 0,
+        }
+
+        try:
+            if not state_file_path.exists():
+                logging.warning(f"State file {state_file_path} does not exist")
+                return state
+
+            with open(state_file_path, "r") as f:
+                content = f.read()
+
+                # Parse the state file sections
+            sections = content.split("###!")
+            current_section = None
+            current_content = []
+
+            for section in sections:
+                if not section.strip():
+                    continue
+
+                lines = section.strip().split("\n")
+                if not lines:
+                    continue
+
+                # Extract section name from the first line (format: "SECTION !###")
+                first_line = lines[0].strip()
+                if " !###" in first_line:
+                    section_name = first_line.split(" !###")[0].strip()
+                    section_content = lines[1:] if len(lines) > 1 else []
+
+                    # Skip if we've already processed this section (avoid duplicates)
+                    if section_name in [
+                        "FUNCTIONS",
+                        "ALIASES",
+                        "SHELL_OPTIONS",
+                        "ENVIRONMENT",
+                        "WORKING_DIRECTORY",
+                        "EXIT_CODE",
+                    ] and state.get(section_name.lower().replace("_", "")):
+                        continue
+                else:
+                    # Skip sections that don't match the expected format
+                    continue
+
+                if section_name == "FUNCTIONS":
+                    # Parse function definitions
+                    current_func = None
+                    func_lines = []
+
+                    for line in section_content:
+                        if line.startswith("declare -f "):
+                            if current_func and func_lines:
+                                state["functions"][current_func] = "\n".join(func_lines)
+                            current_func = line.split(" ")[2]
+                            func_lines = [line]
+                        elif current_func and line.strip():
+                            func_lines.append(line)
+
+                    if current_func and func_lines:
+                        state["functions"][current_func] = "\n".join(func_lines)
+
+                elif section_name == "ALIASES":
+                    # Parse alias definitions
+                    for line in section_content:
+                        if line.startswith("alias "):
+                            parts = line.split("=", 1)
+                            if len(parts) == 2:
+                                alias_name = parts[0].split(" ")[1]
+                                alias_value = parts[1].strip("'\"")
+                                state["aliases"][alias_name] = alias_value
+
+                elif section_name == "SHELL_OPTIONS":
+                    # Parse shell options
+                    for line in section_content:
+                        if line.startswith("set "):
+                            options = line[4:].split()
+                            for opt in options:
+                                if opt.startswith("-") or opt.startswith("+"):
+                                    state["shell_options"][opt] = True
+
+                elif section_name == "ENVIRONMENT":
+                    # Parse environment variables
+                    for line in section_content:
+                        if "=" in line:
+                            key, value = line.split("=", 1)
+                            state["environment"][key] = value
+
+                elif section_name == "WORKING_DIRECTORY":
+                    # Parse working directory
+                    if section_content:
+                        state["working_directory"] = section_content[0].strip()
+
+                elif section_name == "EXIT_CODE":
+                    # Parse exit code
+                    if section_content:
+                        try:
+                            state["exit_code"] = int(section_content[0].strip())
+                        except ValueError:
+                            state["exit_code"] = 0
+
+        except Exception as e:
+            logging.warning(f"Failed to parse state file {state_file_path}: {e}")
+
+        return state
+
+    def _update_state_from_file(self, state_file_path: Path) -> None:
+        """Updates the shell state by reading from the state file."""
+        state = self._parse_state_file(state_file_path)
+
+        # Update shell state with captured values
+        if state["functions"]:
+            self.functions = state["functions"]
+
+        if state["aliases"]:
+            self.aliases = state["aliases"]
+
+        if state["shell_options"]:
+            self.options = state["shell_options"]
+
+        if state["environment"]:
+            # Update environment variables, preserving existing ones not in the file
+            for key, value in state["environment"].items():
+                self.env[key] = value
+                logging.debug(f"Updated environment variable: {key}={value}")
+
+        if state["working_directory"]:
+            # Update working directory if it exists and is accessible
+            try:
+                if os.path.exists(state["working_directory"]) and os.path.isdir(
+                    state["working_directory"]
+                ):
+                    self.working_dir = state["working_directory"]
+                    # Also update PWD in environment
+                    self.env["PWD"] = state["working_directory"]
+                    logging.info(f"Working directory updated to: {self.working_dir}")
+            except Exception as e:
+                logging.warning(f"Failed to update working directory: {e}")
+
+        logging.info(
+            f"Updated shell state: {len(state['functions'])} functions, {len(state['aliases'])} aliases, {len(state['shell_options'])} options, {len(state['environment'])} env vars, working_dir: {state['working_directory']}"
+        )
+
+    def _cleanup_state_file(self, state_file_path: Path) -> None:
+        """Cleans up the state file after use."""
+        try:
+            if state_file_path.exists():
+                state_file_path.unlink()
+                logging.debug(f"Cleaned up state file: {state_file_path}")
+        except Exception as e:
+            logging.warning(f"Failed to cleanup state file {state_file_path}: {e}")
+
+    def reset(self) -> None:
+        """Reset the shell session state."""
+        self.working_dir = None
+        self.env = None
+        self.functions = {}
+        self.aliases = {}
+        self.options = {}
+        self._initialize_session()
+
+    def execute_command(self, command: str) -> tuple[str, str, int]:
+        """Execute a shell command and return (stdout, stderr, returncode)."""
+        import subprocess
+
+        try:
+            # Remove the leading '!' and strip whitespace
+            shell_command = command.lstrip().lstrip("!").strip()
+
+            if not shell_command:
+                return "", "Error: No command provided after '!'", 1
+
+            # Expand tilde (~) to home directory in command arguments
+            import shlex
+
+            try:
+                # Split the command into parts to handle tilde expansion in arguments
+                parts = shlex.split(shell_command)
+                expanded_parts = []
+                for part in parts:
+                    # Only expand tilde if it's at the start of a word and not quoted
+                    if part.startswith("~") and (
+                        len(part) == 1 or part[1] in "/\\" or part[1].isalnum()
+                    ):
+                        expanded_parts.append(os.path.expanduser(part))
+                    else:
+                        expanded_parts.append(part)
+                shell_command = " ".join(expanded_parts)
+            except Exception as e:
+                # If parsing fails, fall back to simple expansion
+                logging.warning(f"Failed to parse command for tilde expansion: {e}")
+                shell_command = os.path.expanduser(shell_command)
+
+            # Store the command for potential redirect
+            self.last_command = shell_command
+
+            # Check for exit command
+            if shell_command.lower() in ["exit", "quit"]:
+                self.reset()
+                return (
+                    "",
+                    "Shell session reset. A new session will be started on the next command.",
+                    0,
+                )
+
+            # Execute command with current shell state
+            try:
+                # Create unique state file path
+                state_file_path = self._create_state_file_path()
+
+                # Prepare command with state restoration
+                state_restore_commands = []
+
+                # Set working directory if available
+                if self.working_dir:
+                    state_restore_commands.append(f"cd '{self.working_dir}'")
+
+                # Restore functions
+                for func_name, func_def in self.functions.items():
+                    state_restore_commands.append(func_def)
+
+                # Restore aliases
+                for alias_name, alias_value in self.aliases.items():
+                    state_restore_commands.append(f"alias {alias_name}='{alias_value}'")
+
+                # Restore shell options
+                for option, enabled in self.options.items():
+                    if enabled:
+                        state_restore_commands.append(f"set {option}")
+
+                # Restore environment variables that differ from parent process
+                parent_env = os.environ.copy()
+                env_restore_count = 0
+                for key, value in self.env.items():
+                    if key not in parent_env or parent_env[key] != value:
+                        state_restore_commands.append(f"export {key}='{value}'")
+                        env_restore_count += 1
+
+                logging.debug(f"Restoring {env_restore_count} environment variables")
+                logging.debug(f"Working directory for next command: {self.working_dir}")
+
+                # Generate state capture commands
+                state_capture_commands = self._generate_state_capture_commands(
+                    state_file_path
+                )
+
+                # Combine state restoration, command execution, and state capture
+                full_command = "\n".join(
+                    [*state_restore_commands, shell_command, state_capture_commands]
+                )
+
+                # Check if we need to sandbox the shell
+                container_settings = self.settings.get("containers", {})
+                sandbox_shell = container_settings.get(
+                    "sandboxBangShellCommands", False
+                )
+
+                if sandbox_shell:
+                    executable, args = self._wrap_command_for_container(
+                        full_command, state_file_path
+                    )
+                    command_to_run = [executable] + args
+                else:
+                    command_to_run = full_command
+
+                try:
+                    result = subprocess.run(
+                        command_to_run,
+                        # Use shell=True for non-sandboxed (string command), shell=False for sandboxed (list command)
+                        shell=not sandbox_shell,
+                        capture_output=True,
+                        text=True,
+                        cwd=self.working_dir if not sandbox_shell else None,
+                        env=self.env,
+                        timeout=30,
+                    )
+
+                    # Store command output for potential redirect
+                    self.last_stdout = result.stdout
+                    self.last_stderr = result.stderr
+                    self.last_returncode = result.returncode
+
+                except FileNotFoundError:
+                    if sandbox_shell:
+                        return (
+                            "",
+                            f"Error: Container engine '{container_settings.get('engine', 'docker')}' not found. Please ensure it is installed and in your PATH.",
+                            1,
+                        )
+                    else:
+                        raise
+
+                # Update shell state from the captured state file
+                try:
+                    logging.debug(f"Updating shell state from file: {state_file_path}")
+                    self._update_state_from_file(state_file_path)
+                    logging.debug(
+                        f"Shell state updated - working_dir: {self.working_dir}, env vars: {len(self.env)}"
+                    )
+
+                    # Debug: Show some key environment variables
+                    if self.env:
+                        pwd_val = self.env.get("PWD", "not set")
+                        home_val = self.env.get("HOME", "not set")
+                        logging.debug(f"PWD: {pwd_val}, HOME: {home_val}")
+
+                except Exception as e:
+                    logging.warning(f"Failed to update shell state from file: {e}")
+
+                # Clean up the state file
+                self._cleanup_state_file(state_file_path)
+
+                # Format output in terminal-like style
+                output_parts = []
+
+                # Combine stdout and stderr in the order they would appear in a terminal
+                # Most commands don't produce stderr, so stdout first is usually correct
+                if result.stdout:
+                    # Remove state capture output from the end of stdout
+                    output_lines = result.stdout.split("\n")
+
+                    # Find where the state capture starts (look for the state capture script)
+                    state_start_idx = -1
+                    for i, line in enumerate(output_lines):
+                        if line.strip().startswith(
+                            "#!/bin/bash"
+                        ) and "Capture complete shell state" in " ".join(
+                            output_lines[i : i + 3]
+                        ):
+                            state_start_idx = i
+                            break
+
+                    # Remove state capture output if found
+                    if state_start_idx != -1:
+                        output_lines = output_lines[:state_start_idx]
+
+                    # Remove trailing empty lines
+                    while output_lines and not output_lines[-1].strip():
+                        output_lines.pop()
+
+                    if output_lines:
+                        output_parts.append("\n".join(output_lines).rstrip())
+
+                if result.stderr:
+                    # Add stderr after stdout (typical terminal behavior)
+                    if output_parts:
+                        output_parts.append("")  # Empty line separator
+                    output_parts.append(result.stderr.rstrip())
+
+                # Only show exit code if it's non-zero
+                if result.returncode != 0:
+                    if output_parts:
+                        output_parts.append("")  # Empty line separator
+                    output_parts.append(f"Exit code: {result.returncode}")
+
+                # Join all output parts
+                response = "\n".join(output_parts) if output_parts else ""
+
+                return response, "", result.returncode
+
+            except subprocess.TimeoutExpired:
+                return "", "Command timed out after 30 seconds.", 1
+
+        except Exception as e:
+            return "", f"Error executing command: {e}", 1
+
+    def _wrap_command_for_container(
+        self, shell_command: str, state_file_path: Path
+    ) -> tuple[str, list[str]]:
+        """Wraps a shell command to be run inside a container."""
+        container_settings = self.settings.get("containers", {})
+        engine = container_settings.get("engine", "docker")
+
+        # The command to run inside the container is bash
+        command = "bash"
+        # The argument to bash is the shell command itself
+        args = ["-c", shell_command]
+
+        if engine == "docker":
+            return self._wrap_command_for_docker(
+                shell_command, container_settings, state_file_path
+            )
+        elif engine == "apptainer":
+            return self._wrap_command_for_apptainer(
+                shell_command, container_settings, state_file_path
+            )
+        else:
+            # Should not happen if settings are validated, but as a fallback
+            logging.warning(
+                f"Container engine '{engine}' not supported for sandboxed shell. Running on host."
+            )
+            return command, args
+
+    def _wrap_command_for_docker(
+        self, shell_command: str, container_settings: dict, state_file_path: Path
+    ) -> tuple[str, list[str]]:
+        """Wraps a shell command to be run inside a Docker container."""
+        image = container_settings.get("image")
+        home_mount_point = container_settings.get("home_mount_point")
+
+        docker_cmd = "docker"
+        docker_args = [
+            "run",
+            "--rm",
+            "-i",
+        ]  # Run, remove on exit, and interactive for stdin
+
+        # Match host user UID/GID to avoid permission issues
+        if sys.platform in ["linux", "darwin"]:
+            uid = os.getuid()
+            gid = os.getgid()
+            docker_args.extend(["--user", f"{uid}:{gid}"])
+
+        # Mount allowedPaths read-write
+        allowed_paths = self.settings.get("allowedPaths", [])
+        resolved_workdir = None
+        for path_str in allowed_paths:
+            path = Path(path_str).resolve()
+            if path.exists():
+                docker_args.extend(["-v", f"{path}:{path}:rw"])
+                if (
+                    resolved_workdir is None
+                ):  # Set workdir to the first valid allowed path
+                    resolved_workdir = path
+
+        # Mount the state file directory to preserve state across container runs
+        # Mount the entire /tmp directory to ensure the state file is accessible
+        docker_args.extend(["-v", "/tmp:/tmp:rw"])
+
+        # Set workdir. If no allowed paths, use home directory inside container
+        if resolved_workdir:
+            docker_args.extend(["--workdir", str(resolved_workdir)])
+        else:
+            docker_args.extend(["--workdir", home_mount_point])
+
+        # The container image to use
+        docker_args.append(image)
+
+        # The shell command to run inside the container
+        docker_args.append("bash")
+        docker_args.extend(["-c", shell_command])
+
+        logging.info(f"Wrapped shell command to run in Docker: {shell_command}")
+        return docker_cmd, docker_args
+
+    def _wrap_command_for_apptainer(
+        self, shell_command: str, container_settings: dict, state_file_path: Path
+    ) -> tuple[str, list[str]]:
+        """Wraps a shell command to be run inside an Apptainer container."""
+        image = container_settings.get("image")
+        home_mount_point = container_settings.get("home_mount_point")
+
+        apptainer_cmd = "apptainer"
+        apptainer_args = [
+            "--silent",  # Suppress INFO messages (global flag)
+            "run",
+            "--cleanenv",  # Clean environment to ensure complete control
+        ]
+
+        # Mount allowedPaths read-write
+        allowed_paths = self.settings.get("allowedPaths", [])
+        resolved_workdir = None
+        for path_str in allowed_paths:
+            path = Path(path_str).resolve()
+            if path.exists():
+                apptainer_args.extend(["--bind", f"{path}:{path}:rw"])
+                if resolved_workdir is None:  # Set workdir to first valid path
+                    resolved_workdir = path
+
+        # Mount the state file directory to preserve state across container runs
+        # Mount the entire /tmp directory to ensure the state file is accessible
+        apptainer_args.extend(["--bind", "/tmp:/tmp:rw"])
+
+        # Set workdir
+        if resolved_workdir:
+            apptainer_args.extend(["--pwd", str(resolved_workdir)])
+
+        # Pass environment variables to preserve shell state
+        # Use --env flags to explicitly pass environment variables
+        for key, value in self.env.items():
+            apptainer_args.extend(["--env", f"{key}={value}"])
+
+        # Image URI must be specified for Apptainer
+        apptainer_args.append(f"docker://{image}")
+
+        # The shell command to run inside the container
+        apptainer_args.append("bash")
+        apptainer_args.extend(["-c", shell_command])
+
+        logging.info(f"Wrapped shell command to run in Apptainer: {shell_command}")
+        return apptainer_cmd, apptainer_args
+
+    def get_working_directory(self) -> str:
+        """Get the current working directory."""
+        return self.working_dir if self.working_dir else os.getcwd()
+
+    def get_last_command_info(self) -> tuple[str, str, str, int]:
+        """Get information about the last executed command."""
+        return (
+            self.last_command,
+            self.last_stdout,
+            self.last_stderr,
+            self.last_returncode,
+        )
 
 
 def main():
