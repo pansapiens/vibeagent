@@ -554,7 +554,7 @@ class ChatApp(App):
         self.tools_by_source = {}  # New
         self.instrumentor = SmolagentsInstrumentor() if TELEMETRY_AVAILABLE else None
         self.telemetry_is_active = False
-        self.default_strategy = self.settings.get(
+        self.default_compress_strategy = self.settings.get(
             "contextManagementStrategy", "drop_oldest"
         )
         self.global_context_length = self.settings.get("contextLength", 8192)
@@ -1859,7 +1859,7 @@ class ChatApp(App):
                 self.action_select_model()
             return True
         if command == "/compress":
-            strategy = arg.strip() if arg else self.default_strategy
+            strategy = arg.strip() if arg else self.default_compress_strategy
             self.compress_context(strategy)
             return True
         if command == "/dump-context":
