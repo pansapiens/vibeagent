@@ -1508,7 +1508,8 @@ class ChatApp(App):
                         continue
 
                     command, args = self._wrap_command_for_container(name, config)
-                    env = config.get("env", {})
+                    # Allow both "environment" and "env" as equivalent keys
+                    env = config.get("environment", config.get("env", {}))
                     if command:
                         full_env = {**os.environ, **env}
 
