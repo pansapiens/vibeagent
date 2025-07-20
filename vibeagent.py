@@ -2245,7 +2245,9 @@ class ChatApp(App):
             summary_prompt = f"""
             Summarize the following conversation history concisely while retaining key information. 
             DON'T summarize the tools available, but do include a summary of the tools used. 
-            ALWAYS include the actual content of the final answer.
+            ALWAYS include the actual content of the final_answer.
+            You MUST determine the content that the user was interested in and keep that - this may not always be the last message.
+            If search results were returned, keep the actual results.
             If the user has been generating code or files, include the final version of the code 
             or final file path(s):\n\n{history_text}
             """.strip()
@@ -2257,21 +2259,60 @@ class ChatApp(App):
                 api_key=summary_model_details["api_key"],
                 api_base=summary_model_details["api_base"],
             )
-            summarizer_agent = ToolCallingAgent(
-                model=summarizer_model,
-                tools=[],  # No special tools for now
-                add_base_tools=True,  # Needs final_answer tool
-            )
 
-            # Run the summarizer agent to get the summary
-            summary = summarizer_agent.run(summary_prompt)
+            # Use direct model call instead of agent for summarization
+            try:
+                messages = [
+                    ChatMessage(
+                        role=MessageRole.SYSTEM,
+                        content=[
+                            {
+                                "type": "text",
+                                "text": "You are a helpful assistant that summarizes conversations.",
+                            }
+                        ],
+                    ),
+                    ChatMessage(
+                        role=MessageRole.USER,
+                        content=[{"type": "text", "text": summary_prompt}],
+                    ),
+                ]
+
+                response = summarizer_model.generate(messages)
+                summary = response.content
+                if isinstance(summary, list):
+                    summary = "".join(
+                        c.get("text", "")
+                        for c in summary
+                        if isinstance(c, dict) and "text" in c
+                    )
+                elif isinstance(summary, str):
+                    summary = summary
+                else:
+                    summary = str(summary)
+
+                if not summary or summary.strip() == "":
+                    self._display_ui_message(
+                        "Warning: Summarization returned empty result. Using fallback summary.",
+                        is_error=True,
+                    )
+                    summary = f"Conversation summary: Previous conversation has been compressed. Key information has been preserved."
+
+            except Exception as e:
+                self._display_ui_message(
+                    f"Error during summarization: {e}. Using fallback summary.",
+                    is_error=True,
+                )
+                summary = f"Conversation summary: Previous conversation has been compressed. Key information has been preserved."
 
             # Get the token usage from the summarizer agent's last step
             summarizer_token_usage = None
-            if summarizer_agent.memory.steps:
-                last_step = summarizer_agent.memory.steps[-1]
-                if hasattr(last_step, "token_usage") and last_step.token_usage:
-                    summarizer_token_usage = last_step.token_usage
+            # For direct model calls, we don't have access to token usage from the model
+            # We'll use the estimated token count instead
+
+            # Calculate approximate token count for the summary content
+            # Use a simple approximation: 1 token ≈ 4 characters for English text
+            summary_tokens = len(summary) // 4 if summary else 0
 
             # Create a simple summary step to replace the history
             timing = Timing(start_time=time.time())
@@ -2279,17 +2320,23 @@ class ChatApp(App):
             summary_step = ActionStep(
                 step_number=1,
                 timing=timing,
-                model_output="Conversation summary:",
-                observations=summary,
+                model_output=summary,  # Put the summary in model_output instead of observations
+                observations=None,  # Clear observations to avoid TOOL_RESPONSE message
                 token_usage=summarizer_token_usage
                 or TokenUsage(
-                    input_tokens=0, output_tokens=0
-                ),  # Use summarizer's token usage or fallback
+                    input_tokens=summary_tokens, output_tokens=summary_tokens
+                ),  # Use summarizer's token usage or estimate from summary content
             )
 
             # Replace the agent's memory with just the summary
             self.agent.memory.steps = [summary_step]
             self.agent.step_number = 2
+
+            # Show the summary content for debugging
+            self._display_ui_message(
+                f"Summary created:\n\n{summary[:500]}{'...' if len(summary) > 500 else ''}",
+                render_as_markdown=True,
+            )
 
         # Remove status message
         status_widget.remove()
