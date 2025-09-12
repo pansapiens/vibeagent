@@ -1055,7 +1055,12 @@ class ChatApp(App):
                 pass
 
     def _wrap_command_for_docker(
-        self, server_name: str, command: str, args: list[str], container_settings: dict
+        self,
+        server_name: str,
+        command: str,
+        args: list[str],
+        container_settings: dict,
+        env: dict | None = None,
     ) -> tuple[str, list[str]]:
         """Wraps a command to be run inside a Docker container."""
         image = container_settings.get("image")
@@ -1098,6 +1103,11 @@ class ChatApp(App):
         else:
             docker_args.extend(["--workdir", home_mount_point])
 
+        # Pass environment variables if provided
+        if env:
+            for key, value in env.items():
+                docker_args.extend(["-e", f"{key}={value}"])
+
         # The container image to use
         docker_args.append(image)
 
@@ -1109,7 +1119,12 @@ class ChatApp(App):
         return docker_cmd, docker_args
 
     def _wrap_command_for_apptainer(
-        self, server_name: str, command: str, args: list[str], container_settings: dict
+        self,
+        server_name: str,
+        command: str,
+        args: list[str],
+        container_settings: dict,
+        env: dict | None = None,
     ) -> tuple[str, list[str]]:
         """Wraps a command to be run inside an Apptainer container."""
         image = container_settings.get("image")
@@ -1139,6 +1154,11 @@ class ChatApp(App):
         # Set workdir
         if resolved_workdir:
             apptainer_args.extend(["--pwd", str(resolved_workdir)])
+
+        # Pass environment variables if provided
+        if env:
+            for key, value in env.items():
+                apptainer_args.extend(["--env", f"{key}={value}"])
 
         # Image URI must be specified for Apptainer
         apptainer_args.append(f"docker://{image}")
@@ -1181,6 +1201,9 @@ class ChatApp(App):
             )
             return command, args
 
+        # Extract environment variables from server config
+        env = server_config.get("environment", server_config.get("env", {}))
+
         common_args = {
             "server_name": server_name,
             "command": command,
@@ -1189,8 +1212,12 @@ class ChatApp(App):
         }
 
         if engine == "docker":
+            # Pass environment variables to docker wrapper
+            common_args["env"] = env
             return self._wrap_command_for_docker(**common_args)
         elif engine == "apptainer":
+            # Pass environment variables to apptainer wrapper
+            common_args["env"] = env
             return self._wrap_command_for_apptainer(**common_args)
         else:
             logging.warning(
@@ -1460,7 +1487,7 @@ class ChatApp(App):
             try:
                 # Show message that we're starting MCP servers
                 self._display_ui_message("Starting MCP servers...", from_thread=True)
-                
+
                 # Monkey patch stdio_client to use our custom log files
                 from mcp.client.stdio import stdio_client
 
