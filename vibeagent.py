@@ -8,6 +8,7 @@
 #   "openai",
 #   "textual-autocomplete",
 #   "platformdirs",
+#   "tiktoken",
 # ]
 # ///
 
@@ -27,6 +28,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from contextlib import redirect_stdout
 import platformdirs
+import tiktoken
 from smolagents import ToolCallingAgent, tool, MCPClient
 from smolagents.models import OpenAIServerModel, MessageRole, ChatMessage, TokenUsage
 from smolagents.monitoring import Timing
@@ -834,6 +836,14 @@ class ChatApp(App):
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(session_data, f, indent=2, cls=VibeAgentJSONEncoder)
 
+            # Update previous_session in settings
+            session_name = path.stem
+            if session_name not in ["_default"] and not session_name.startswith(
+                "_autosave_"
+            ):  # Don't track _default or _autosave_ sessions
+                self.settings["previous_session"] = session_name
+                self._save_settings()
+
             self._display_ui_message(f"Session saved to {path}")
 
         except Exception as e:
@@ -858,6 +868,15 @@ class ChatApp(App):
         except Exception as e:
             # Don't display error messages for auto-save to avoid cluttering the UI
             logging.error(f"Auto-save error: {e}", exc_info=True)
+
+    def _save_settings(self):
+        """Saves the current settings to settings.json."""
+        try:
+            settings_path = self.config_dir / "settings.json"
+            with open(settings_path, "w", encoding="utf-8") as f:
+                json.dump(self.settings, f, indent=2)
+        except Exception as e:
+            logging.error(f"Error saving settings: {e}", exc_info=True)
 
     def delete_session(self, name: str | None):
         """Deletes a saved session file."""
@@ -1631,8 +1650,9 @@ class ChatApp(App):
             add_base_tools=True,
         )
 
-        # Update title with model ID
-        self.title = f"vibeagent ({self.model_id})"
+        # Update title with model ID and token usage
+        base_title = f"vibeagent ({self.model_id})"
+        self.title = self._format_title_with_tokens(base_title)
 
         if not startup:
             self._display_ui_message(f"Switched to model: {self.model_id}")
@@ -1738,6 +1758,11 @@ class ChatApp(App):
         chat_history.mount(Markdown(response_text, classes="agent-message"))
         chat_history.scroll_end()
 
+        # Update title with current token usage
+        if not self._check_shell_mode(""):  # Only update if not in shell mode
+            base_title = f"vibeagent ({self.model_id})"
+            self.title = self._format_title_with_tokens(base_title)
+
         # Auto-save after agent response
         self._auto_save_session()
 
@@ -1773,6 +1798,42 @@ class ChatApp(App):
         return [
             f.stem for f in self.sessions_dir.glob("*.json") if f.stem != "_default"
         ]
+
+    def get_previous_session(self) -> str | None:
+        """Gets the previous session name from settings or finds the most recent auto-save session."""
+        # First check if we have a previous_session saved in settings
+        previous_session = self.settings.get("previous_session")
+        if previous_session:
+            # Verify the session file still exists
+            session_path = self.sessions_dir / f"{previous_session}.json"
+            if session_path.exists():
+                return previous_session
+
+        # If no previous_session in settings or file doesn't exist, find most recent auto-save session
+        if not self.sessions_dir.exists():
+            return None
+
+        # Look for _autosave_YYYYmmdd_HHMMSS pattern sessions (auto-save sessions)
+        autosave_sessions = []
+        for session_file in self.sessions_dir.glob("_autosave_*.json"):
+            stem = session_file.stem
+            # Extract timestamp from _autosave_YYYYmmdd_HHMMSS format
+            if stem.startswith("_autosave_") and len(stem) > 10:
+                timestamp_part = stem[10:]  # Remove "_autosave_" prefix
+                if len(timestamp_part) >= 15:  # YYYYmmdd_HHMMSS format
+                    try:
+                        # Parse the timestamp to validate format
+                        datetime.strptime(timestamp_part, "%Y%m%d_%H%M%S")
+                        autosave_sessions.append((session_file, timestamp_part))
+                    except ValueError:
+                        continue
+
+        if not autosave_sessions:
+            return None
+
+        # Sort by timestamp (most recent first) and return the most recent
+        autosave_sessions.sort(key=lambda x: x[1], reverse=True)
+        return autosave_sessions[0][0].stem
 
     def get_autocomplete_candidates(self, state: TargetState) -> list[DropdownItem]:
         """Provides dynamic candidates for the autocomplete dropdown."""
@@ -1851,8 +1912,21 @@ class ChatApp(App):
             self.save_session(arg)
             return True
         if command == "/load":
-            self.run_worker(partial(self.load_session, arg), thread=True)
-            return True
+            # If no argument provided, try to load the previous session
+            if not arg:
+                previous_session = self.get_previous_session()
+                if previous_session:
+                    self.run_worker(
+                        partial(self.load_session, previous_session), thread=True
+                    )
+                else:
+                    self._display_ui_message(
+                        "No previous session found. Use '/load <session_name>' to load a specific session."
+                    )
+                return True
+            else:
+                self.run_worker(partial(self.load_session, arg), thread=True)
+                return True
         if command == "/delete":
             self.run_worker(partial(self.delete_session, arg), thread=True)
             return True
@@ -2117,17 +2191,94 @@ class ChatApp(App):
             self.query_one(Input).placeholder = "Ask the agent to do something..."
             chat_history.scroll_end()
 
+    def _count_tokens_with_tiktoken(self, text: str) -> int:
+        """Count tokens using tiktoken with cl100k_base encoding (GPT-4/3.5 compatible)."""
+        try:
+            encoding = tiktoken.get_encoding("cl100k_base")
+            return len(encoding.encode(text))
+        except Exception:
+            # Fallback to rough approximation if tiktoken fails
+            return len(text) // 4
+
     def get_current_context_tokens(self) -> int:
-        """Calculates the total token count from the agent's memory."""
+        """Calculates the total token count from the agent's memory.
+
+        This method provides a more accurate token count by:
+        1. First trying to use actual token usage from model responses
+        2. If that's not available, estimating by counting tokens in the conversation
+        3. Using tiktoken for accurate token counting when possible
+        """
         if not self.agent or not self.agent.memory.steps:
-            self._display_ui_message("Agent is not initialized.", is_error=True)
             return 0
 
-        total_tokens = 0
+        # Method 1: Try to get accurate token counts from model responses
+        # This is the most accurate when available
+        total_tokens_from_steps = 0
+        has_accurate_counts = True
+
         for step in self.agent.memory.steps:
             if hasattr(step, "token_usage") and step.token_usage:
-                total_tokens += step.token_usage.total_tokens
-        return total_tokens
+                total_tokens_from_steps += step.token_usage.total_tokens
+            else:
+                # If any step lacks token_usage, we'll need to estimate
+                has_accurate_counts = False
+
+        # Method 2: Estimate by counting tokens in the actual conversation
+        # This is more accurate than summing step tokens when there might be overlap
+        try:
+            messages = self.agent.write_memory_to_messages()
+            estimated_tokens = 0
+
+            for message in messages:
+                if hasattr(message, "content") and message.content:
+                    if isinstance(message.content, list):
+                        # Handle multimodal content
+                        for content_item in message.content:
+                            if (
+                                isinstance(content_item, dict)
+                                and "text" in content_item
+                            ):
+                                estimated_tokens += self._count_tokens_with_tiktoken(
+                                    content_item["text"]
+                                )
+                    elif isinstance(message.content, str):
+                        estimated_tokens += self._count_tokens_with_tiktoken(
+                            message.content
+                        )
+
+            # Use the more accurate method available
+            if has_accurate_counts and total_tokens_from_steps > 0:
+                # If we have accurate counts, use them but also check if they seem reasonable
+                # compared to our estimation (to catch potential double-counting issues)
+                if estimated_tokens > 0:
+                    ratio = total_tokens_from_steps / estimated_tokens
+                    if (
+                        0.5 <= ratio <= 2.0
+                    ):  # If within reasonable range, use step counts
+                        return total_tokens_from_steps
+                    else:
+                        # If step counts seem inflated, use estimation
+                        return estimated_tokens
+                else:
+                    return total_tokens_from_steps
+            else:
+                # Use estimation when step counts aren't available
+                return estimated_tokens
+
+        except Exception:
+            # Final fallback to the original method
+            return total_tokens_from_steps
+
+    def _format_title_with_tokens(self, base_title: str) -> str:
+        """Formats the title with current token usage information."""
+        current_tokens = self.get_current_context_tokens()
+        max_context = self.model_context_lengths.get(self.model_id)
+
+        if max_context is not None:
+            percentage = (current_tokens / max_context) * 100
+            return f"{base_title} [{current_tokens}/{max_context} ({percentage:.1f}%)]"
+        else:
+            return f"{base_title} [{current_tokens}]"
 
     def _format_context_as_markdown(self, messages: list[dict]) -> str:
         """Formats the agent's message history into a readable markdown string."""
@@ -2368,9 +2519,8 @@ class ChatApp(App):
             # For direct model calls, we don't have access to token usage from the model
             # We'll use the estimated token count instead
 
-            # Calculate approximate token count for the summary content
-            # Use a simple approximation: 1 token ≈ 4 characters for English text
-            summary_tokens = len(summary) // 4 if summary else 0
+            # Calculate accurate token count for the summary content using tiktoken
+            summary_tokens = self._count_tokens_with_tiktoken(summary) if summary else 0
 
             # Create a simple summary step to replace the history
             timing = Timing(start_time=time.time())
@@ -2404,6 +2554,12 @@ class ChatApp(App):
         self._display_ui_message(
             f"Context compressed from {initial_tokens} to {new_tokens} tokens."
         )
+
+        # Update title with new token usage
+        if not self._check_shell_mode(""):  # Only update if not in shell mode
+            base_title = f"vibeagent ({self.model_id})"
+            self.title = self._format_title_with_tokens(base_title)
+
         chat_history.scroll_end()
 
     def _apply_glitch(self, text: str) -> str:
@@ -2525,8 +2681,9 @@ class ChatApp(App):
             current_dir = self.shell_session.get_working_directory()
             self.title = f"vibeagent - {current_dir}"
         else:
-            # Restore the title with model ID
-            self.title = f"vibeagent ({self.model_id})"
+            # Restore the title with model ID and token usage
+            base_title = f"vibeagent ({self.model_id})"
+            self.title = self._format_title_with_tokens(base_title)
 
     def _check_shell_mode(self, text: str) -> bool:
         """Checks if the input text indicates shell mode (starts with '!' after stripping whitespace)."""
