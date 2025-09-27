@@ -1,4 +1,4 @@
-# Use a lightweight Python base image
+# A generic container that MCPs can install and run inside
 FROM python:3.12-slim
 
 # Set environment variables to prevent interactive prompts during installation
