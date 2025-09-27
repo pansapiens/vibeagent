@@ -581,6 +581,11 @@ class ChatApp(App):
         # Initialize shell session
         self.shell_session = ShellSession(self.settings)
 
+        # Async MCP startup state
+        self.mcp_startup_worker = None
+        self.mcp_startup_complete = False
+        self.queued_first_message = None
+
     def _is_phoenix_running(self) -> bool:
         import socket
         from urllib.parse import urlparse
@@ -743,6 +748,11 @@ class ChatApp(App):
                 token_usage_data = step_dict["token_usage"]
                 if "total_tokens" in token_usage_data:
                     del token_usage_data["total_tokens"]
+                # Ensure all required fields are present
+                if "input_tokens" not in token_usage_data:
+                    token_usage_data["input_tokens"] = 0
+                if "output_tokens" not in token_usage_data:
+                    token_usage_data["output_tokens"] = 0
                 step_dict["token_usage"] = TokenUsage(**token_usage_data)
 
             if "tool_calls" in step_dict and step_dict["tool_calls"]:
@@ -1012,6 +1022,15 @@ class ChatApp(App):
             f"Found {len(self.available_models)} available models from {len(all_models_by_provider)} provider(s)."
         )
 
+        # If we don't have an agent yet (because model details weren't available during setup_basic_agent),
+        # create it now that we have the model details
+        if not self.agent and self.model_id in self.model_details:
+            logging.info("Creating agent now that model details are available")
+            self.update_agent_with_new_model(self.model_id, startup=True)
+            self._display_ui_message(
+                f"Agent is ready. Model: {self.model_id}. Type your message and press Enter."
+            )
+
     def on_mount(self) -> None:
         """Called when the app is mounted. Sets up the agent and MCP connections."""
         # Register and set the custom theme
@@ -1032,9 +1051,7 @@ class ChatApp(App):
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             self.auto_save_session_name = f"_autosave_{timestamp}"
 
-        # provider = trace.get_tracer_provider()
-        # provider.add_span_processor(SimpleSpanProcessor(self.TextualSpanExporter(self)))
-        self._display_ui_message("Initializing agent and connecting to tool servers...")
+        # Initialize the agent synchronously (fast operation)
         self.favorite_models = self.settings.get("favoriteModels", [])
         self.run_worker(self.fetch_models, thread=True)
 
@@ -1048,16 +1065,17 @@ class ChatApp(App):
                 )
                 # Continue anyway - the worker will handle MCP server setup
 
-        self.is_loading = True
-        self.query_one(Input).placeholder = "Initializing agent..."
-        self.run_worker(
-            partial(self.setup_agent_and_tools, self.settings),
-            name="setup_agent",
+        # Setup basic agent synchronously (fast operation)
+        self._display_ui_message("Initializing agent...")
+        self.setup_basic_agent(self.settings)
+
+        # Start MCP servers asynchronously in the background
+        self._display_ui_message("Starting MCP servers in background...")
+        self.mcp_startup_worker = self.run_worker(
+            partial(self.setup_mcp_servers, self.settings),
+            name="setup_mcp_servers",
             thread=True,
         )
-        chat_history = self.query_one("#chat-history")
-        chat_history.mount(LoadingIndicator(classes="agent-thinking"))
-        chat_history.scroll_end()
 
     def on_unmount(self) -> None:
         """Called when the app is unmounted. Disconnects the MCP client."""
@@ -1179,8 +1197,16 @@ class ChatApp(App):
             for key, value in env.items():
                 apptainer_args.extend(["--env", f"{key}={value}"])
 
-        # Image URI must be specified for Apptainer
-        apptainer_args.append(f"docker://{image}")
+        # Image URI for Apptainer: support local paths ("/" or "file://")
+        image_uri = (
+            image
+            if (
+                isinstance(image, str)
+                and (image.startswith("/") or image.startswith("file://"))
+            )
+            else f"docker://{image}"
+        )
+        apptainer_args.append(image_uri)
 
         # Original command
         apptainer_args.append(command)
@@ -1189,11 +1215,31 @@ class ChatApp(App):
         logging.info(f"Wrapped command for '{server_name}' to run in Apptainer.")
         return apptainer_cmd, apptainer_args
 
+    def _merge_container_settings(self, server_name: str, server_config: dict) -> dict:
+        """Merges per-server container settings with global container settings."""
+        global_container_settings = self.settings.get("containers", {})
+        server_container_settings = server_config.get("container", {})
+
+        # Start with global settings as base
+        merged_settings = global_container_settings.copy()
+
+        # Override with per-server settings if they exist
+        for key, value in server_container_settings.items():
+            merged_settings[key] = value
+
+        # Special handling for enabled flag: if server explicitly sets enabled=false,
+        # that overrides the global setting
+        if "enabled" in server_container_settings:
+            merged_settings["enabled"] = server_container_settings["enabled"]
+
+        return merged_settings
+
     def _wrap_command_for_container(
         self, server_name: str, server_config: dict
     ) -> tuple[str, list[str]]:
         """Wraps a command to be run inside a container if enabled."""
-        container_settings = self.settings.get("containers", {})
+        # Get merged container settings (per-server overrides global)
+        container_settings = self._merge_container_settings(server_name, server_config)
 
         command = str(server_config.get("command"))
         args = server_config.get("args", [])
@@ -1271,47 +1317,77 @@ class ChatApp(App):
             return False
 
     def _check_and_pull_container_image(self) -> bool:
-        """Check if container image exists and pull it if needed. Returns True if successful."""
-        container_settings = self.settings.get("containers", {})
+        """Check if container images exist and pull them if needed. Returns True if successful."""
+        # Collect all unique container configurations from MCP servers
+        server_configs = self.settings.get("mcpServers", {})
+        container_configs = set()  # Use set to avoid duplicates
 
-        if not container_settings.get("enabled", False):
+        # Add global container settings if enabled
+        global_container_settings = self.settings.get("containers", {})
+        if global_container_settings.get("enabled", False):
+            container_configs.add(
+                (
+                    global_container_settings.get("engine", "docker"),
+                    global_container_settings.get("image"),
+                )
+            )
+
+        # Add per-server container settings
+        for server_name, server_config in server_configs.items():
+            if not server_config.get("enabled", True):
+                continue
+
+            # Get merged container settings for this server
+            merged_settings = self._merge_container_settings(server_name, server_config)
+
+            if merged_settings.get("enabled", False):
+                engine = merged_settings.get("engine", "docker")
+                image = merged_settings.get("image")
+                if image:  # Only add if image is specified
+                    container_configs.add((engine, image))
+
+        # If no containers are enabled, return True
+        if not container_configs:
             return True
 
-        engine = container_settings.get("engine", "docker")
-        image = container_settings.get("image")
-
-        if not image:
-            self._display_ui_message(
-                "Container enabled but no image specified in settings",
-                is_error=True,
-            )
-            return False
-
-        # Check if the container engine is available
-        if not self._check_container_engine_available(engine):
-            self._display_ui_message(
-                f"Container engine '{engine}' is not available. Please install {engine} and ensure it's in your PATH.",
-                is_error=True,
-            )
-            return False
-
-        try:
-            if engine == "docker":
-                return self._check_and_pull_docker_image(image)
-            elif engine == "apptainer":
-                return self._check_and_pull_apptainer_image(image)
-            else:
+        # Check and pull each unique container image
+        for engine, image in container_configs:
+            if not image:
                 self._display_ui_message(
-                    f"Unsupported container engine: {engine}",
+                    f"Container enabled but no image specified for engine '{engine}'",
                     is_error=True,
                 )
                 return False
-        except Exception as e:
-            self._display_ui_message(
-                f"Error checking/pulling container image: {e}",
-                is_error=True,
-            )
-            return False
+
+            # Check if the container engine is available
+            if not self._check_container_engine_available(engine):
+                self._display_ui_message(
+                    f"Container engine '{engine}' is not available. Please install {engine} and ensure it's in your PATH.",
+                    is_error=True,
+                )
+                return False
+
+            try:
+                if engine == "docker":
+                    if not self._check_and_pull_docker_image(image):
+                        return False
+                elif engine == "apptainer":
+                    if not self._check_and_pull_apptainer_image(image):
+                        return False
+                else:
+                    self._display_ui_message(
+                        f"Unsupported container engine: {engine}",
+                        is_error=True,
+                    )
+                    return False
+            except Exception as e:
+                self._display_ui_message(
+                    f"Error checking/pulling container image {image}: {e}",
+                    is_error=True,
+                )
+                return False
+
+        return True
 
     def _check_and_pull_docker_image(self, image: str) -> bool:
         """Check if Docker image exists and pull it if needed."""
@@ -1382,8 +1458,16 @@ class ChatApp(App):
         import subprocess
 
         try:
+            # Determine image URI (support local paths)
+            if isinstance(image, str) and (
+                image.startswith("/") or image.startswith("file://")
+            ):
+                image_uri = image
+            else:
+                image_uri = f"docker://{image}"
+
             # Always pull Apptainer images since cache checking is unreliable
-            self._display_ui_message(f"Pulling Apptainer image docker://{image}...")
+            self._display_ui_message(f"Pulling Apptainer image {image_uri}...")
 
             # Add loading indicator
             chat_history = self.query_one("#chat-history")
@@ -1394,7 +1478,7 @@ class ChatApp(App):
             try:
                 # Use apptainer run with a no-op to pull and cache the image without creating a .sif file
                 result = subprocess.run(
-                    ["apptainer", "run", f"docker://{image}", "echo", "Done!"],
+                    ["apptainer", "run", image_uri, "echo", "Done!"],
                     capture_output=True,
                     text=True,
                     timeout=300,  # 5 minutes timeout for pull
@@ -1410,7 +1494,7 @@ class ChatApp(App):
                         result.stderr.strip() if result.stderr else "Unknown error"
                     )
                     self._display_ui_message(
-                        f"Failed to pull Apptainer image docker://{image}: {error_msg}",
+                        f"Failed to pull Apptainer image {image_uri}: {error_msg}",
                         is_error=True,
                     )
                     return False
@@ -1430,18 +1514,9 @@ class ChatApp(App):
             )
             return False
 
-    def setup_agent_and_tools(self, settings):
-        """Initializes the MCP client and the agent with all available tools."""
-        logging.info("Starting agent and tool setup...")
-
-        # Check if containers are enabled and if we should proceed with MCP servers
-        container_settings = self.settings.get("containers", {})
-        containers_enabled = container_settings.get("enabled", False)
-
-        if containers_enabled:
-            # If containers are enabled but we're in a worker thread, we can't check/pull images here
-            # The image pulling should have been done in the main thread before this worker started
-            logging.info("Containers are enabled - MCP servers will run in containers")
+    def setup_basic_agent(self, settings):
+        """Initializes the agent with local tools only (no MCP servers)."""
+        logging.info("Starting basic agent setup...")
 
         class CaptureIO(io.StringIO):
             encoding = "utf-8"
@@ -1493,8 +1568,44 @@ class ChatApp(App):
 
         local_tools = [aider_edit_file]
         self.tools_by_source = {"inbuilt": local_tools}
-        mcp_tools = []
+        self.all_tools = local_tools
         self.settings = settings
+
+        # Try to update agent with model, but don't fail if model details aren't available yet
+        logging.info("Updating agent with new model...")
+        if self.model_id in self.model_details:
+            self.update_agent_with_new_model(self.model_id, startup=True)
+            # Show that the agent is ready
+            self._display_ui_message(
+                f"Agent is ready. Model: {self.model_id}. Type your message and press Enter."
+            )
+        else:
+            logging.info(
+                "Model details not yet available, will update when fetch_models completes"
+            )
+            self._display_ui_message(
+                "Agent is initializing. Model details are being fetched..."
+            )
+
+        self.query_one(Input).placeholder = "Ask the agent to do something..."
+        self.query_one("#input").focus(scroll_visible=True)
+
+        logging.info("Basic agent setup complete.")
+
+    def setup_mcp_servers(self, settings):
+        """Initializes MCP servers and adds their tools to the existing agent."""
+        logging.info("Starting MCP server setup...")
+
+        # Check if containers are enabled and if we should proceed with MCP servers
+        container_settings = self.settings.get("containers", {})
+        containers_enabled = container_settings.get("enabled", False)
+
+        if containers_enabled:
+            # If containers are enabled but we're in a worker thread, we can't check/pull images here
+            # The image pulling should have been done in the main thread before this worker started
+            logging.info("Containers are enabled - MCP servers will run in containers")
+
+        mcp_tools = []
         server_configs = self.settings.get("mcpServers", {})
         logging.info(f"Found {len(server_configs)} MCP server configurations.")
 
@@ -1505,7 +1616,9 @@ class ChatApp(App):
         if server_configs:
             try:
                 # Show message that we're starting MCP servers
-                self._display_ui_message("Starting MCP servers...", from_thread=True)
+                self._display_ui_message(
+                    "Connecting to MCP servers...", from_thread=True
+                )
 
                 # Monkey patch stdio_client to use our custom log files
                 from mcp.client.stdio import stdio_client
@@ -1609,12 +1722,69 @@ class ChatApp(App):
                         pass
                 self.mcp_log_files.clear()
 
-        self.all_tools = local_tools + mcp_tools
-        logging.info(f"Total tools initialized: {len(self.all_tools)}")
+        # Add MCP tools to existing tools
+        self.all_tools.extend(mcp_tools)
+        logging.info(f"Total tools after MCP setup: {len(self.all_tools)}")
 
-        logging.info("Updating agent with new model...")
-        self.update_agent_with_new_model(self.model_id, startup=True)
-        logging.info("Agent and tool setup complete.")
+        # Update the agent with the new tools
+        if self.agent:
+            self.agent.tools = {tool.name: tool for tool in self.all_tools}
+            logging.info("Updated agent with MCP tools")
+
+        # Note: mcp_startup_complete flag is now set in the main thread via on_worker_state_changed
+        # to avoid thread synchronization issues
+
+        self._display_ui_message(
+            "MCP servers connected successfully!", from_thread=True
+        )
+        logging.info("MCP server setup complete.")
+
+    def _process_queued_message(self):
+        """Process the queued first message after MCP servers are ready."""
+        logging.info(
+            f"_process_queued_message called with queued_first_message: {self.queued_first_message}"
+        )
+
+        if self.queued_first_message:
+            message = self.queued_first_message
+            self.queued_first_message = None
+            logging.info(f"Processing queued message: {message}")
+
+            # Display the user's message in chat history first
+            try:
+                chat_history = self.query_one("#chat-history")
+                chat_history.mount(Static(f"> {message}", classes="user-message"))
+                chat_history.scroll_end()
+
+                # Add to command history
+                self.command_history.append(message)
+                self.history_index = len(self.command_history)
+
+                # Show that we're processing the queued message
+                self._display_ui_message(
+                    "Processing your queued message...", is_error=False
+                )
+
+                # Process the queued message
+                self.is_loading = True
+                self.query_one(Input).placeholder = "Waiting for response..."
+                chat_history.mount(LoadingIndicator(classes="agent-thinking"))
+                chat_history.scroll_end()
+
+                logging.info("UI setup complete, starting agent worker")
+
+            except Exception as e:
+                logging.error(f"Error setting up UI for queued message: {e}")
+                # Continue anyway, the worker will still run
+
+            self.agent_worker = self.run_worker(
+                partial(self.get_agent_response, message),
+                thread=True,
+                name=f"Queued message: {message[:30]}",
+            )
+            logging.info(f"Agent worker started for queued message: {message[:30]}")
+        else:
+            logging.info("No queued message to process")
 
     def update_agent_with_new_model(self, model_id: str, startup: bool = False):
         """Creates a new agent with the specified model."""
@@ -1660,34 +1830,42 @@ class ChatApp(App):
 
     async def on_worker_state_changed(self, event: Worker.StateChanged) -> None:
         """Called when a worker's state changes."""
-        if event.worker.name == "setup_agent":
-            # Remove the loading indicator when the setup worker finishes
+        logging.info(
+            f"Worker state changed: {event.worker.name} -> {event.worker.state}"
+        )
+
+        if event.worker.name == "setup_mcp_servers":
+            # Handle MCP server setup completion
             if event.worker.state == WorkerState.SUCCESS:
-                # The worker is done, update the UI.
-                self.is_loading = False
-                logging.info(f"Model initialized: {self.model_id}")
-                self._display_ui_message(
-                    f"Agent is ready. Model: {self.model_id}. Type your message and press Enter."
-                )
-                try:
-                    self.query_one(".agent-thinking").remove()
-                except Exception:
-                    pass  # It might have already been removed
-                self.query_one(Input).placeholder = "Ask the agent to do something..."
-                self.query_one("#input").focus(scroll_visible=True)
+                logging.info("MCP servers setup completed successfully")
+                # Ensure the flag is set in the main thread
+                self.mcp_startup_complete = True
+                # Process any queued message now that MCP servers are ready
+                if self.queued_first_message:
+                    logging.info(
+                        f"Processing queued first message after MCP startup: {self.queued_first_message}"
+                    )
+                    self._process_queued_message()
+                else:
+                    logging.info("No queued message to process")
             elif event.worker.state == WorkerState.ERROR:
-                # The worker failed
-                self.is_loading = False
+                logging.error(f"MCP servers setup failed: {event.worker.error}")
                 self._display_ui_message(
-                    f"Agent setup failed: {event.worker.error}",
+                    f"MCP servers setup failed: {event.worker.error}",
                     is_error=True,
+                    from_thread=True,
                     exc_info=True,
                 )
-                try:
-                    self.query_one(".agent-thinking").remove()
-                except Exception:
-                    pass  # It might have already been removed
-                self.query_one(Input).placeholder = "Agent failed to initialize."
+                # Even if MCP servers failed, mark as complete so the agent can still work
+                self.mcp_startup_complete = True
+                # Process any queued message even if MCP servers failed
+                if self.queued_first_message:
+                    logging.info(
+                        f"Processing queued first message after MCP startup failure: {self.queued_first_message}"
+                    )
+                    self._process_queued_message()
+                else:
+                    logging.info("No queued message to process after MCP failure")
 
     def compose(self) -> ComposeResult:
         """Creates the layout for the chat application."""
@@ -1700,8 +1878,15 @@ class ChatApp(App):
 
     def get_agent_response(self, user_message: str) -> None:
         """Worker to get response from agent."""
-        self.call_from_thread(self._update_telemetry_status)
+        logging.info(f"get_agent_response called with message: {user_message[:50]}")
+        try:
+            self.call_from_thread(self._update_telemetry_status)
+        except Exception as e:
+            logging.error(f"Error updating telemetry status: {e}")
+            # Continue anyway, telemetry is not critical
+
         if self.agent:
+            logging.info("Agent is available, proceeding with request")
             try:
                 allowed_paths = self.settings.get("allowedPaths", [])
 
@@ -1731,12 +1916,18 @@ class ChatApp(App):
                     "allowedPaths": ", ".join(allowed_paths),
                     "pwd": current_dir,
                 }
+                logging.info(f"Calling agent.run with message: {user_message[:50]}")
                 response = self.agent.run(
                     user_message, additional_args=context_dict, reset=False
                 )
+                logging.info(f"Agent response received: {str(response)[:100]}")
                 self.post_message(self.AgentResponse(response))
             except Exception as e:
+                logging.error(f"Error in get_agent_response: {e}", exc_info=True)
                 self.post_message(self.AgentResponse(f"Error: {str(e)}"))
+        else:
+            logging.error("Agent is None, cannot process request")
+            self.post_message(self.AgentResponse("Error: Agent is not initialized"))
 
     def on_chat_app_agent_response(self, message: AgentResponse) -> None:
         """Handles the agent's response."""
@@ -2022,11 +2213,27 @@ class ChatApp(App):
         if user_message.startswith("/") and self._handle_command(user_message):
             return
 
-        if not self.agent:
-            self._display_ui_message(
-                "Agent is not yet initialized. Please wait.", is_error=True
-            )
-            return
+        # Check if MCP servers are still starting up
+        if not self.mcp_startup_complete and self.mcp_startup_worker:
+            # Queue the first message if MCP servers aren't ready yet
+            if self.queued_first_message is None:
+                self.queued_first_message = user_message
+                logging.info(f"Queuing first message: {user_message}")
+                self._display_ui_message(
+                    "MCP servers are still connecting. Your message will be processed once they're ready.",
+                    is_error=False,
+                )
+                return
+            else:
+                # If there's already a queued message, show error
+                logging.info(
+                    f"Message rejected - already have queued message: {self.queued_first_message}"
+                )
+                self._display_ui_message(
+                    "Please wait for MCP servers to finish connecting before sending another message.",
+                    is_error=True,
+                )
+                return
 
         self.is_loading = True
         self.query_one(Input).placeholder = "Waiting for response..."
@@ -2034,6 +2241,7 @@ class ChatApp(App):
         chat_history.mount(LoadingIndicator(classes="agent-thinking"))
         chat_history.scroll_end()
 
+        logging.info(f"Starting agent worker for regular message: {user_message[:30]}")
         self.agent_worker = self.run_worker(
             partial(self.get_agent_response, user_message),
             thread=True,
@@ -2217,7 +2425,11 @@ class ChatApp(App):
         has_accurate_counts = True
 
         for step in self.agent.memory.steps:
-            if hasattr(step, "token_usage") and step.token_usage:
+            if (
+                hasattr(step, "token_usage")
+                and step.token_usage
+                and hasattr(step.token_usage, "total_tokens")
+            ):
                 total_tokens_from_steps += step.token_usage.total_tokens
             else:
                 # If any step lacks token_usage, we'll need to estimate
@@ -2525,15 +2737,23 @@ class ChatApp(App):
             # Create a simple summary step to replace the history
             timing = Timing(start_time=time.time())
             timing.end_time = time.time()
+
+            # Create token usage object with proper attributes
+            if summarizer_token_usage:
+                token_usage = summarizer_token_usage
+            else:
+                token_usage = TokenUsage(
+                    input_tokens=summary_tokens,
+                    output_tokens=summary_tokens,
+                    total_tokens=summary_tokens * 2,  # input + output
+                )
+
             summary_step = ActionStep(
                 step_number=1,
                 timing=timing,
                 model_output=summary,  # Put the summary in model_output instead of observations
                 observations=None,  # Clear observations to avoid TOOL_RESPONSE message
-                token_usage=summarizer_token_usage
-                or TokenUsage(
-                    input_tokens=summary_tokens, output_tokens=summary_tokens
-                ),  # Use summarizer's token usage or estimate from summary content
+                token_usage=token_usage,
             )
 
             # Replace the agent's memory with just the summary
@@ -3561,8 +3781,16 @@ sync "{state_file_path}"
         for key, value in self.env.items():
             apptainer_args.extend(["--env", f"{key}={value}"])
 
-        # Image URI must be specified for Apptainer
-        apptainer_args.append(f"docker://{image}")
+        # Image URI for Apptainer: support local paths ("/" or "file://")
+        image_uri = (
+            image
+            if (
+                isinstance(image, str)
+                and (image.startswith("/") or image.startswith("file://"))
+            )
+            else f"docker://{image}"
+        )
+        apptainer_args.append(image_uri)
 
         # The shell command to run inside the container
         apptainer_args.append("bash")
