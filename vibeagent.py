@@ -4249,26 +4249,24 @@ class ShellSession:
         """Initializes the shell session with working directory and environment."""
         import os
 
-        # Set initial working directory from allowedPaths if available
+        # Use the current working directory where the program was launched from
+        # This preserves the user's intended working directory
+        self.working_dir = os.getcwd()
+
+        # Verify that the current working directory is in allowedPaths
         allowed_paths = self.settings.get("allowedPaths", [])
         if allowed_paths:
-            initial_path = allowed_paths[0]
-            # Expand environment variables and user home directory
-            initial_path = os.path.expanduser(os.path.expandvars(initial_path))
-            if os.path.exists(initial_path) and os.path.isdir(initial_path):
-                self.working_dir = initial_path
-                # Change the actual working directory to the first allowed path
-                try:
-                    os.chdir(initial_path)
-                    logging.info(f"Changed working directory to: {initial_path}")
-                except Exception as e:
-                    logging.warning(
-                        f"Failed to change working directory to {initial_path}: {e}"
-                    )
-            else:
-                self.working_dir = os.getcwd()
-        else:
-            self.working_dir = os.getcwd()
+            # Expand environment variables and user home directory for comparison
+            expanded_allowed_paths = [
+                os.path.expanduser(os.path.expandvars(path)) for path in allowed_paths
+            ]
+
+            # Check if current working directory is in allowed paths
+            if self.working_dir not in expanded_allowed_paths:
+                logging.warning(
+                    f"Current working directory {self.working_dir} is not in allowedPaths. "
+                    f"Shell commands may be restricted."
+                )
 
         # Initialize environment with current environment
         self.env = os.environ.copy()
