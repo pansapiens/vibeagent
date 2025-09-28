@@ -237,6 +237,96 @@ class ModelSelectProvider(Provider):
             )
 
 
+class JsonSettingsScreen(ModalScreen[None]):
+    """Screen for editing application settings as raw JSON."""
+
+    BINDINGS = [
+        ("escape", "cancel", "Cancel"),
+        ("ctrl+s", "save", "Save"),
+    ]
+
+    def __init__(self, settings: dict) -> None:
+        super().__init__()
+        self.settings = settings.copy()
+        self.original_settings = settings.copy()
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="json-settings-dialog"):
+            yield Static("JSON Settings Editor", classes="dialog-title")
+
+            # Create TextArea with JSON syntax highlighting
+            json_text = json.dumps(self.settings, indent=2, sort_keys=True)
+
+            # Create a container for the TextArea with proper sizing
+            with Vertical(id="json-textarea-container"):
+                yield TextArea.code_editor(
+                    json_text, language="json", id="json-settings-textarea"
+                )
+
+            # Horizontal layout for buttons
+            with Horizontal(id="json-settings-buttons"):
+                yield Button("Save", id="save-json-settings", variant="primary")
+                yield Button("Cancel", id="cancel-json-settings", variant="default")
+
+    def action_save(self) -> None:
+        """Save the JSON settings."""
+        self._save_json_settings()
+
+    def action_cancel(self) -> None:
+        """Cancel editing and close the screen."""
+        self.dismiss(None)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        """Handle button presses."""
+        if event.button.id == "save-json-settings":
+            self._save_json_settings()
+        elif event.button.id == "cancel-json-settings":
+            self.dismiss(None)
+
+    def _save_json_settings(self) -> None:
+        """Save the JSON settings from the text area."""
+        try:
+            textarea = self.query_one("#json-settings-textarea", TextArea)
+            json_text = textarea.text
+
+            # Parse the JSON to validate it
+            new_settings = json.loads(json_text)
+
+            # Dismiss with the new settings
+            self.dismiss(new_settings)
+
+        except json.JSONDecodeError as e:
+            # Show error message
+            self._show_error(f"Invalid JSON: {e}")
+        except Exception as e:
+            self._show_error(f"Error saving settings: {e}")
+
+    def _show_error(self, message: str) -> None:
+        """Show an error message."""
+        # Try to show error in the UI, fallback to console
+        try:
+            # Create a temporary error display
+            error_static = Static(f"❌ {message}", classes="error-message")
+            # Add it to the dialog temporarily
+            dialog = self.query_one("#json-settings-dialog")
+            dialog.mount(error_static)
+            # Remove it after 3 seconds
+            self.set_timer(3.0, lambda: error_static.remove())
+        except Exception:
+            # Fallback to console if UI display fails
+            print(f"Error: {message}")
+
+    def on_mount(self) -> None:
+        """Called when the screen is mounted."""
+        # Focus the TextArea and ensure it's properly loaded
+        try:
+            textarea = self.query_one("#json-settings-textarea", TextArea)
+            textarea.focus()
+        except Exception as e:
+            # If there's an error focusing the textarea, just continue
+            pass
+
+
 class SettingsScreen(ModalScreen[None]):
     """Screen for editing application settings."""
 
@@ -1263,6 +1353,30 @@ class ChatApp(App):
         color: $footer-key-foreground;
         text-style: bold;
     }
+
+    #json-textarea-container {
+        height: 1fr;
+        min-height: 15;
+    }
+
+    #json-settings-textarea {
+        height: 100%;
+        min-height: 15;
+    }
+
+    #json-settings-buttons {
+        height: 3;
+        margin-top: 1;
+    }
+
+    .error-message {
+        background: $error;
+        color: white;
+        text-style: bold;
+        padding: 1;
+        margin: 1;
+        border: solid $error;
+    }
     """
 
     BINDINGS = [
@@ -1455,6 +1569,7 @@ class ChatApp(App):
         config_dir: Path,
         log_dir: Path,
         data_dir: Path,
+        settings: dict = None,
     ):
         super().__init__()
         self.title = "vibeagent"
@@ -1462,7 +1577,7 @@ class ChatApp(App):
         self.mcp_clients = []
         self.command_history = []
         self.history_index = -1
-        self.settings = {}
+        self.settings = settings or {}
         self.mcp_log_files = {}  # Store MCP server log files
         self.model_config = model_config
         self.model_id = initial_model_id
@@ -2552,7 +2667,6 @@ class ChatApp(App):
         local_tools = [aider_edit_file]
         self.tools_by_source = {"inbuilt": local_tools}
         self.all_tools = local_tools
-        self.settings = settings
 
         # Try to update agent with model, but don't fail if model details aren't available yet
         logging.info("Updating agent with new model...")
@@ -3158,7 +3272,10 @@ class ChatApp(App):
             self.show_settings()
             return True
         if command == "/settings":
-            self.action_open_settings()
+            if arg and arg.strip().lower() == "json":
+                self.action_open_json_settings()
+            else:
+                self.action_open_settings()
             return True
         return False
 
@@ -3388,6 +3505,20 @@ class ChatApp(App):
                 self._display_ui_message("Settings saving…")
 
         self.push_screen(SettingsScreen(self.settings), on_settings_saved)
+
+    def action_open_json_settings(self) -> None:
+        """Open the JSON settings screen."""
+
+        def on_json_settings_saved(settings: dict | None):
+            if settings is not None:
+                # Update the in-memory settings immediately
+                self.settings.update(settings)
+                # Kick off a background save so UI remains responsive
+                # Pass a snapshot so worker isn't tied to mutable dict
+                self._save_settings_worker(dict(self.settings))
+                self._display_ui_message("JSON settings saving…")
+
+        self.push_screen(JsonSettingsScreen(self.settings), on_json_settings_saved)
 
     def _count_tokens_with_tiktoken(self, text: str) -> int:
         """Count tokens using tiktoken with cl100k_base encoding (GPT-4/3.5 compatible)."""
@@ -4918,8 +5049,8 @@ def main():
         config_dir=config_dir,
         log_dir=log_dir,
         data_dir=data_dir,
+        settings=settings,
     )
-    app.settings = settings  # Set the settings after instantiation
     app.run()
 
 

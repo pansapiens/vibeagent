@@ -39,6 +39,7 @@ vibeagent
 - `/compress [strategy]` - Manually compress the conversation history to save tokens. Strategies: `drop_oldest`, `middle_out`, `summarize`.
 - `/dump-context [format]` - Display the agent's current memory. Format can be `markdown` (default) or `json`.
 - `/settings` - Open the interactive settings screen to configure endpoints, MCP servers, containers, and other options.
+- `/settings json` - Open a raw JSON editor for editing the settings.json file directly.
 - `/show-settings` - Displays the location of configuration files and their current content.
 
 ### Shell Commands
