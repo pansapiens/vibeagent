@@ -1,6 +1,9 @@
 .aider*
 .env
 *.log
+build/
+.crush
+.serena
 
 __pycache__/
 *.egg-info/

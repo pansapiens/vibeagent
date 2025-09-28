@@ -7,7 +7,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "smolagents[litellm,mcp,telemetry,toolkit]",
-    "textual",
+    "textual[syntax]",
     "python-dotenv",
     "aider-chat",
     "openai",
@@ -16,8 +16,15 @@ dependencies = [
     "tiktoken",
 ]
 
+[project.optional-dependencies]
+dev = ["textual-dev"]
+
 [project.scripts]
 vibeagent = "vibeagent:main"
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 py-modules = ["vibeagent"]

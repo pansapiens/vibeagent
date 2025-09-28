@@ -23,6 +23,7 @@ import random
 import string
 import shlex
 from datetime import datetime
+from textual import work
 from functools import partial
 from pathlib import Path
 from dotenv import load_dotenv
@@ -34,7 +35,7 @@ from smolagents.models import OpenAIServerModel, MessageRole, ChatMessage, Token
 from smolagents.monitoring import Timing
 from mcp import StdioServerParameters
 from textual.app import App, ComposeResult
-from textual.containers import ScrollableContainer, Vertical
+from textual.containers import ScrollableContainer, Vertical, Horizontal
 from textual.widgets import (
     Header,
     Footer,
@@ -43,6 +44,20 @@ from textual.widgets import (
     Markdown,
     OptionList,
     LoadingIndicator,
+    Button,
+    Select,
+    Switch,
+    TextArea,
+    Label,
+    Tabs,
+    Tab,
+    TabbedContent,
+    TabPane,
+    Collapsible,
+    Checkbox,
+    RadioSet,
+    RadioButton,
+    ContentSwitcher,
 )
 from textual.widgets.option_list import Option
 from textual.message import Message
@@ -222,6 +237,836 @@ class ModelSelectProvider(Provider):
             )
 
 
+class SettingsScreen(ModalScreen[None]):
+    """Screen for editing application settings."""
+
+    BINDINGS = [
+        ("escape", "cancel", "Cancel"),
+    ]
+
+    def __init__(self, settings: dict) -> None:
+        super().__init__()
+        self.settings = settings.copy()
+        self.original_settings = settings.copy()
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="settings-dialog"):
+            yield Static("Settings", classes="dialog-title")
+
+            # Use TabbedContent for proper horizontal tabs
+            with TabbedContent(id="settings-tabs"):
+                with TabPane("General", id="tab-general"):
+                    yield from self._compose_general_tab()
+                with TabPane("Endpoints", id="tab-endpoints"):
+                    yield from self._compose_endpoints_tab()
+                with TabPane("MCP Servers", id="tab-mcp"):
+                    yield from self._compose_mcp_tab()
+                with TabPane("Containers", id="tab-containers"):
+                    yield from self._compose_containers_tab()
+
+            with Vertical(id="settings-buttons"):
+                yield Button("Save", id="save-settings", variant="primary")
+                yield Button("Cancel", id="cancel-settings", variant="default")
+
+    def _compose_general_tab(self) -> ComposeResult:
+        """Compose the General settings tab."""
+        # Default Model
+        yield Label("Default Model:")
+        favorite_models = self.settings.get("favoriteModels", [])
+        model_options = [(model, model) for model in favorite_models]
+        current_model = self.settings.get("defaultModel", "")
+        # If current model is not in favorites, add it to the options
+        if current_model and current_model not in favorite_models:
+            model_options.insert(0, (current_model, current_model))
+        yield Select(
+            model_options,
+            id="default-model-select",
+        )
+
+        # Context Length
+        yield Label("Context Length:")
+        yield Input(
+            str(self.settings.get("contextLength", 16384)),
+            placeholder="16384",
+            id="context-length-input",
+        )
+
+        # Context Management Strategy
+        yield Label("Context Management Strategy:")
+        strategy_options = [
+            ("Drop Oldest", "drop_oldest"),
+            ("Middle Out", "middle_out"),
+            ("Summarize", "summarize"),
+        ]
+        # Get current strategy or use default
+        current_strategy = self.settings.get("contextManagementStrategy")
+        if current_strategy and current_strategy in [
+            "drop_oldest",
+            "middle_out",
+            "summarize",
+        ]:
+            initial_strategy = current_strategy
+        else:
+            initial_strategy = "summarize"
+
+        yield Select(
+            strategy_options,
+            id="context-strategy-select",
+            allow_blank=False,
+            value=initial_strategy,
+        )
+
+        # SearXNG URL
+        yield Label("SearXNG URL:")
+        yield Input(
+            self.settings.get("searxng_url", ""),
+            placeholder="http://localhost:8086",
+            id="searxng-url-input",
+        )
+
+        # Auto Save
+        yield Switch(self.settings.get("autoSave", True), id="auto-save-switch")
+        yield Label("Auto Save Sessions", classes="switch-label")
+
+        # Allow Current Directory
+        yield Switch(
+            self.settings.get("allowCurrentDirectory", True),
+            id="allow-current-dir-switch",
+        )
+        yield Label("Allow Current Directory", classes="switch-label")
+
+        # Allowed Paths
+        yield Label("Allowed Paths:")
+        paths_text = "\n".join(self.settings.get("allowedPaths", []))
+        yield TextArea(paths_text, id="allowed-paths-textarea")
+
+        # Favorite Models
+        yield Label("Favorite Models:")
+        with Vertical(id="favorite-models-container"):
+            # Favorite models will be populated dynamically
+            pass
+
+        # Add new favorite model
+        with Horizontal():
+            yield Select([], id="available-models-select", allow_blank=True)
+            yield Button(
+                "+ Add to Favorites", id="add-favorite-model-btn", variant="primary"
+            )
+
+    def _compose_endpoints_tab(self) -> ComposeResult:
+        """Compose the Endpoints settings tab."""
+        # Endpoint Selection
+        yield Label("Select Endpoint to Edit:")
+        endpoints = list(self.settings.get("endpoints", {}).keys())
+        endpoint_options = [(name, name) for name in endpoints] + [
+            ("", "Add New Endpoint")
+        ]
+        yield Select(
+            endpoint_options,
+            id="endpoint-select",
+            allow_blank=True,
+        )
+        yield Label("Endpoint Name:")
+        yield Input("", id="endpoint-name-input")
+
+        yield Label("API Key:")
+        yield Input("", id="endpoint-api-key-input")
+
+        yield Label("API Base URL:")
+        yield Input("", id="endpoint-api-base-input")
+
+        yield Switch(True, id="endpoint-enabled-switch")
+        yield Label("Enabled", classes="switch-label")
+
+        yield Button("Add Endpoint", id="save-endpoint-btn", variant="primary")
+        yield Button("Delete Endpoint", id="delete-endpoint-btn", variant="error")
+
+    def _compose_mcp_tab(self) -> ComposeResult:
+        """Compose the MCP Servers settings tab."""
+        # MCP Server Selection
+        yield Label("Select MCP Server to Edit:")
+        servers = list(self.settings.get("mcpServers", {}).keys())
+        server_options = [(name, name) for name in servers] + [
+            ("", "Add New MCP Server")
+        ]
+        yield Select(
+            server_options,
+            id="mcp-server-select",
+            allow_blank=True,
+        )
+        yield Label("MCP Server Name:")
+        yield Input("", id="mcp-server-name-input")
+
+        yield Label("Command:")
+        yield Input("", id="mcp-server-command-input")
+
+        yield Label("Arguments (space separated):")
+        yield Input("", id="mcp-server-args-input")
+
+        # Environment Variables
+        with Collapsible(title="Environment Variables", id="mcp-env-collapsible"):
+            yield Vertical(id="mcp-env-container")
+            yield Button(
+                "+ Add Environment Variable", id="add-env-var-btn", variant="primary"
+            )
+
+        yield Switch(True, id="mcp-server-enabled-switch")
+        yield Label("Enabled", classes="switch-label")
+
+        # Container Settings
+        with Collapsible(title="Container Settings"):
+            yield Switch(False, id="mcp-container-enabled-switch")
+            yield Label("Enabled", classes="switch-label")
+            yield Label("Container Engine:")
+            yield Select(
+                [("None", "none"), ("Docker", "docker"), ("Apptainer", "apptainer")],
+                id="mcp-container-engine-select",
+                allow_blank=False,
+                value="none",  # Default value, will be updated when server is selected
+            )
+            yield Label("Container Image:")
+            yield Input("", id="mcp-container-image-input")
+
+        yield Label("Home Mount Point:")
+        yield Input("/home/agent", id="mcp-container-mount-input")
+
+        yield Switch(False, id="mcp-container-sandbox-switch")
+        yield Label("Sandbox Bang Shell Commands", classes="switch-label")
+
+        yield Button("Add MCP Server", id="save-mcp-server-btn", variant="primary")
+        yield Button("Delete MCP Server", id="delete-mcp-server-btn", variant="error")
+
+    def _compose_containers_tab(self) -> ComposeResult:
+        """Compose the Containers settings tab."""
+        # Global Container Settings
+        yield Label("Global Container Settings:")
+        yield Switch(
+            self.settings.get("containers", {}).get("enabled", False),
+            id="global-container-enabled-switch",
+        )
+        yield Label("Enabled", classes="switch-label")
+        yield Label("Container Engine:")
+        # Get current global container engine or use default
+        global_engine = self.settings.get("containers", {}).get("engine")
+        if global_engine and global_engine in ["none", "docker", "apptainer"]:
+            initial_global_engine = global_engine
+        else:
+            initial_global_engine = "docker"
+
+        yield Select(
+            [("None", "none"), ("Docker", "docker"), ("Apptainer", "apptainer")],
+            id="global-container-engine-select",
+            allow_blank=False,
+            value=initial_global_engine,
+        )
+        yield Label("Container Image:")
+        yield Input(
+            self.settings.get("containers", {}).get("image", ""),
+            id="global-container-image-input",
+        )
+
+        yield Label("Home Mount Point:")
+        yield Input(
+            self.settings.get("containers", {}).get("home_mount_point", "/home/agent"),
+            id="global-container-mount-input",
+        )
+
+        yield Switch(
+            self.settings.get("containers", {}).get("sandboxBangShellCommands", False),
+            id="global-container-sandbox-switch",
+        )
+        yield Label("Sandbox Bang Shell Commands", classes="switch-label")
+
+    def on_mount(self) -> None:
+        """Called when the screen is mounted."""
+        # Update dropdown options first
+        self._update_endpoint_select()
+        self._update_mcp_server_select()
+
+        # Set initial values for Select widgets
+        self._set_initial_select_values()
+
+        # Load initial endpoint data if any exist
+        endpoints = self.settings.get("endpoints", {})
+        if endpoints:
+            self._load_endpoint_data(list(endpoints.keys())[0])
+
+        # Load initial MCP server data if any exist
+        servers = self.settings.get("mcpServers", {})
+        if servers:
+            self._load_mcp_server_data(list(servers.keys())[0])
+        else:
+            # If no servers exist, add an empty environment variable entry
+            self._add_env_var_entry()
+
+        # Load favorite models
+        self._load_favorite_models()
+
+        # Update available models select
+        self._update_available_models_select()
+
+    def _set_initial_select_values(self) -> None:
+        """Set initial values for Select widgets after they're created."""
+        try:
+            # Set default model
+            favorite_models = self.settings.get("favoriteModels", [])
+            current_model = self.settings.get("defaultModel", "")
+            if current_model and current_model in favorite_models:
+                self.query_one("#default-model-select", Select).value = current_model
+            elif favorite_models:
+                self.query_one("#default-model-select", Select).value = favorite_models[
+                    0
+                ]
+
+            # Context strategy is now set during widget creation
+
+            # Set endpoint select - leave blank for list-based settings
+            # (user will select from the list when needed)
+
+            # Set MCP server select - leave blank for list-based settings
+            # (user will select from the list when needed)
+
+            # MCP container engine will be set when a server is selected
+
+            # Global container engine is now set during widget creation
+
+        except Exception as e:
+            print(f"Warning: Could not set initial select values: {e}")
+
+    def _load_endpoint_data(self, endpoint_name: str) -> None:
+        """Load endpoint data into the form."""
+        if not endpoint_name or endpoint_name not in self.settings.get("endpoints", {}):
+            return
+
+        endpoint = self.settings["endpoints"][endpoint_name]
+
+        try:
+            # Update form fields
+            self.query_one("#endpoint-name-input", Input).value = endpoint_name
+            self.query_one("#endpoint-api-key-input", Input).value = endpoint.get(
+                "api_key", ""
+            )
+            self.query_one("#endpoint-api-base-input", Input).value = endpoint.get(
+                "api_base", ""
+            )
+            self.query_one("#endpoint-enabled-switch", Switch).value = endpoint.get(
+                "enabled", True
+            )
+        except Exception as e:
+            # If there's an error loading the data, just log it and continue
+            print(f"Warning: Could not load endpoint data for {endpoint_name}: {e}")
+
+    def _load_mcp_server_data(self, server_name: str) -> None:
+        """Load MCP server data into the form."""
+        if not server_name or server_name not in self.settings.get("mcpServers", {}):
+            return
+
+        server = self.settings["mcpServers"][server_name]
+
+        try:
+            # Update form fields
+            self.query_one("#mcp-server-name-input", Input).value = server_name
+            self.query_one("#mcp-server-command-input", Input).value = server.get(
+                "command", ""
+            )
+            self.query_one("#mcp-server-args-input", Input).value = " ".join(
+                server.get("args", [])
+            )
+
+            # Environment variables
+            env = server.get("env", {})
+            env_container = self.query_one("#mcp-env-container", Vertical)
+            env_container.remove_children()
+
+            for key, value in env.items():
+                self._add_env_var_entry(key, value)
+
+            self.query_one("#mcp-server-enabled-switch", Switch).value = server.get(
+                "enabled", True
+            )
+
+            # Container settings
+            container = server.get("container", {})
+            self.query_one("#mcp-container-enabled-switch", Switch).value = (
+                container.get("enabled", False)
+            )
+
+            # Handle container engine select with validation
+            engine_select = self.query_one("#mcp-container-engine-select", Select)
+            container_engine = container.get("engine")
+            # Ensure the engine value is valid
+            if container_engine and container_engine in ["none", "docker", "apptainer"]:
+                engine_select.value = container_engine
+            else:
+                # Use default value if setting is null or invalid
+                engine_select.value = "docker"
+
+            self.query_one("#mcp-container-image-input", Input).value = container.get(
+                "image", ""
+            )
+            self.query_one("#mcp-container-mount-input", Input).value = container.get(
+                "home_mount_point", "/home/agent"
+            )
+            self.query_one("#mcp-container-sandbox-switch", Switch).value = (
+                container.get("sandboxBangShellCommands", False)
+            )
+        except Exception as e:
+            # If there's an error loading the data, just log it and continue
+            print(f"Warning: Could not load MCP server data for {server_name}: {e}")
+
+    def on_select_changed(self, event: Select.Changed) -> None:
+        """Handle select widget changes."""
+        if event.select.id == "endpoint-select":
+            if event.value:
+                self._load_endpoint_data(event.value)
+        elif event.select.id == "mcp-server-select":
+            if event.value:
+                self._load_mcp_server_data(event.value)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        """Handle button presses."""
+        if event.button.id == "save-settings":
+            # Collect form data first
+            self._save_settings()
+            # Ask the App to persist settings in a background worker
+            try:
+                app = self.app
+                if hasattr(app, "_save_settings_worker"):
+                    app._save_settings_worker(dict(self.settings))
+                else:
+                    # Fallback to synchronous write if worker isn't available
+                    self._write_settings_to_file()
+            except Exception:
+                self._write_settings_to_file()
+            # Dismiss immediately; worker will finish in background
+            self.dismiss(self.settings)
+        elif event.button.id == "cancel-settings":
+            self.dismiss(None)
+        elif event.button.id == "save-endpoint-btn":
+            self._save_endpoint()
+        elif event.button.id == "delete-endpoint-btn":
+            self._delete_endpoint()
+        elif event.button.id == "save-mcp-server-btn":
+            self._save_mcp_server()
+        elif event.button.id == "delete-mcp-server-btn":
+            self._delete_mcp_server()
+        elif event.button.id == "add-env-var-btn":
+            self._add_env_var_entry()
+        elif event.button.id == "add-favorite-model-btn":
+            selected_model = self.query_one("#available-models-select", Select).value
+            if selected_model:
+                self._add_favorite_model_entry(selected_model)
+                self._update_available_models_select()
+        elif event.button.id.endswith("-remove"):
+            # Extract entry ID from button ID
+            entry_id = event.button.id.replace("-remove", "")
+            if entry_id.startswith("env-var-"):
+                self._remove_env_var_entry(entry_id)
+            elif entry_id.startswith("favorite-model-"):
+                self._remove_favorite_model_entry(entry_id)
+
+    def action_cancel(self) -> None:
+        """Handle escape key press - same as cancel button."""
+        self.dismiss(None)
+
+    def _save_settings(self) -> None:
+        """Save all settings."""
+        # General settings - only save if widgets exist
+        try:
+            self.settings["defaultModel"] = self.query_one(
+                "#default-model-select", Select
+            ).value
+        except:
+            pass
+
+        try:
+            self.settings["contextLength"] = int(
+                self.query_one("#context-length-input", Input).value or "16384"
+            )
+        except:
+            pass
+
+        try:
+            self.settings["contextManagementStrategy"] = self.query_one(
+                "#context-strategy-select", Select
+            ).value
+        except:
+            pass
+
+        try:
+            self.settings["searxng_url"] = self.query_one(
+                "#searxng-url-input", Input
+            ).value
+        except:
+            pass
+
+        try:
+            self.settings["autoSave"] = self.query_one(
+                "#auto-save-switch", Switch
+            ).value
+        except:
+            pass
+
+        try:
+            self.settings["allowCurrentDirectory"] = self.query_one(
+                "#allow-current-dir-switch", Switch
+            ).value
+        except:
+            pass
+
+        # Allowed paths
+        try:
+            paths_text = self.query_one("#allowed-paths-textarea", TextArea).text
+            self.settings["allowedPaths"] = [
+                path.strip() for path in paths_text.split("\n") if path.strip()
+            ]
+        except:
+            pass
+
+        # Favorite models
+        try:
+            # Favorite models
+            favorite_models = []
+            try:
+                favorite_container = self.query_one(
+                    "#favorite-models-container", Vertical
+                )
+                for child in favorite_container.children:
+                    if isinstance(child, Horizontal):
+                        # Find the label widget in this horizontal container
+                        label_widget = child.query_one(Label)
+                        # Get the model name from the custom attribute
+                        if hasattr(label_widget, "model_name"):
+                            favorite_models.append(label_widget.model_name)
+            except Exception as e:
+                print(f"Error getting favorite models: {e}")
+                pass
+            self.settings["favoriteModels"] = favorite_models
+        except:
+            pass
+
+        # Global container settings
+        if "containers" not in self.settings:
+            self.settings["containers"] = {}
+
+        try:
+            self.settings["containers"]["enabled"] = self.query_one(
+                "#global-container-enabled-switch", Switch
+            ).value
+        except:
+            pass
+
+        try:
+            self.settings["containers"]["engine"] = self.query_one(
+                "#global-container-engine-select", Select
+            ).value
+        except:
+            pass
+
+        try:
+            self.settings["containers"]["image"] = self.query_one(
+                "#global-container-image-input", Input
+            ).value
+        except:
+            pass
+
+        try:
+            self.settings["containers"]["home_mount_point"] = self.query_one(
+                "#global-container-mount-input", Input
+            ).value
+        except:
+            pass
+
+        try:
+            self.settings["containers"]["sandboxBangShellCommands"] = self.query_one(
+                "#global-container-sandbox-switch", Switch
+            ).value
+        except:
+            pass
+
+    def _clean_settings_for_json(self, settings: dict) -> dict:
+        """Clean settings to ensure they are JSON serializable."""
+        import copy
+
+        def clean_value(value):
+            # Check if it's a NoSelection object by type name
+            if (
+                hasattr(value, "__class__")
+                and value.__class__.__name__ == "NoSelection"
+            ):
+                return None
+            elif isinstance(value, dict):
+                return {k: clean_value(v) for k, v in value.items()}
+            elif isinstance(value, list):
+                return [clean_value(item) for item in value]
+            else:
+                return value
+
+        return clean_value(copy.deepcopy(settings))
+
+    def _write_settings_to_file(self) -> None:
+        """Write the settings to the settings.json file."""
+        try:
+            # Get the config directory from the parent app
+            app = self.app
+            if hasattr(app, "config_dir"):
+                settings_path = app.config_dir / "settings.json"
+            else:
+                # Fallback to current directory
+                settings_path = Path("settings.json")
+
+            # Write to a temporary file first, then rename atomically
+            temp_path = settings_path.with_suffix(".tmp")
+
+            # Clean settings to ensure JSON serialization
+            clean_settings = self._clean_settings_for_json(self.settings)
+
+            with open(temp_path, "w", encoding="utf-8") as f:
+                json.dump(clean_settings, f, indent=2)
+                f.flush()  # Force write to disk
+                os.fsync(f.fileno())  # Ensure data is written to disk
+
+            # Atomically replace the original file
+            temp_path.replace(settings_path)
+
+            # Verify the file was written correctly
+            with open(settings_path, "r", encoding="utf-8") as f:
+                json.load(f)  # This will raise an exception if JSON is invalid
+
+        except Exception as e:
+            print(f"Error writing settings to file: {e}")
+            # If there was an error, try to clean up the temp file
+            try:
+                if "temp_path" in locals() and temp_path.exists():
+                    temp_path.unlink()
+            except:
+                pass
+
+    def _save_endpoint(self) -> None:
+        """Save endpoint settings."""
+        name = self.query_one("#endpoint-name-input", Input).value.strip()
+        if not name:
+            return
+
+        api_key = self.query_one("#endpoint-api-key-input", Input).value
+        api_base = self.query_one("#endpoint-api-base-input", Input).value
+        enabled = self.query_one("#endpoint-enabled-switch", Switch).value
+
+        if "endpoints" not in self.settings:
+            self.settings["endpoints"] = {}
+
+        self.settings["endpoints"][name] = {
+            "api_key": api_key,
+            "api_base": api_base,
+            "enabled": enabled,
+        }
+
+        # Update the select options
+        self._update_endpoint_select()
+
+    def _delete_endpoint(self) -> None:
+        """Delete the selected endpoint."""
+        name = self.query_one("#endpoint-name-input", Input).value.strip()
+        if name and name in self.settings.get("endpoints", {}):
+            del self.settings["endpoints"][name]
+            self._update_endpoint_select()
+            # Clear the form
+            self.query_one("#endpoint-name-input", Input).value = ""
+            self.query_one("#endpoint-api-key-input", Input).value = ""
+            self.query_one("#endpoint-api-base-input", Input).value = ""
+            self.query_one("#endpoint-enabled-switch", Switch).value = True
+
+    def _save_mcp_server(self) -> None:
+        """Save MCP server settings."""
+        name = self.query_one("#mcp-server-name-input", Input).value.strip()
+        if not name:
+            return
+
+        command = self.query_one("#mcp-server-command-input", Input).value
+        args_text = self.query_one("#mcp-server-args-input", Input).value
+        args = [arg.strip() for arg in args_text.split() if arg.strip()]
+
+        # Parse environment variables
+        env = {}
+        try:
+            env_container = self.query_one("#mcp-env-container", Vertical)
+            for child in env_container.children:
+                if isinstance(child, Horizontal):
+                    # Find the input widget in this horizontal container
+                    input_widget = child.query_one(Input)
+                    env_text = input_widget.value.strip()
+                    if env_text and "=" in env_text:
+                        key, value = env_text.split("=", 1)
+                        env[key.strip()] = value.strip()
+        except Exception:
+            env = {}
+
+        enabled = self.query_one("#mcp-server-enabled-switch", Switch).value
+
+        # Container settings
+        container_enabled = self.query_one(
+            "#mcp-container-enabled-switch", Switch
+        ).value
+        container = {}
+        if container_enabled:
+            container = {
+                "enabled": True,
+                "engine": self.query_one("#mcp-container-engine-select", Select).value,
+                "image": self.query_one("#mcp-container-image-input", Input).value,
+                "home_mount_point": self.query_one(
+                    "#mcp-container-mount-input", Input
+                ).value,
+                "sandboxBangShellCommands": self.query_one(
+                    "#mcp-container-sandbox-switch", Switch
+                ).value,
+            }
+
+        if "mcpServers" not in self.settings:
+            self.settings["mcpServers"] = {}
+
+        server_config = {"command": command, "args": args, "enabled": enabled}
+
+        if env:
+            server_config["env"] = env
+
+        if container:
+            server_config["container"] = container
+
+        self.settings["mcpServers"][name] = server_config
+
+        # Update the select options
+        self._update_mcp_server_select()
+
+    def _delete_mcp_server(self) -> None:
+        """Delete the selected MCP server."""
+        name = self.query_one("#mcp-server-name-input", Input).value.strip()
+        if name and name in self.settings.get("mcpServers", {}):
+            del self.settings["mcpServers"][name]
+            self._update_mcp_server_select()
+            # Clear the form
+            self._clear_mcp_form()
+
+    def _update_endpoint_select(self) -> None:
+        """Update the endpoint select options."""
+        endpoints = list(self.settings.get("endpoints", {}).keys())
+        endpoint_options = [(name, name) for name in endpoints] + [
+            ("", "Add New Endpoint")
+        ]
+        select = self.query_one("#endpoint-select", Select)
+        select.set_options(endpoint_options)
+        # Leave blank for list-based settings
+
+    def _update_mcp_server_select(self) -> None:
+        """Update the MCP server select options."""
+        servers = list(self.settings.get("mcpServers", {}).keys())
+        server_options = [(name, name) for name in servers] + [
+            ("", "Add New MCP Server")
+        ]
+        select = self.query_one("#mcp-server-select", Select)
+        select.set_options(server_options)
+        # Leave blank for list-based settings
+
+    def _add_env_var_entry(self, key: str = "", value: str = "") -> None:
+        """Add a new environment variable entry."""
+        env_container = self.query_one("#mcp-env-container", Vertical)
+        entry_id = f"env-var-{len(env_container.children)}"
+
+        # Create the new entry using mount with multiple widgets
+        env_container.mount(
+            Horizontal(
+                Input(
+                    f"{key}={value}", id=f"{entry_id}-input", placeholder="KEY=value"
+                ),
+                Button("−", id=f"{entry_id}-remove", variant="error"),
+            )
+        )
+
+    def _remove_env_var_entry(self, entry_id: str) -> None:
+        """Remove an environment variable entry."""
+        try:
+            entry = self.query_one(f"#{entry_id}", Horizontal)
+            entry.remove()
+        except:
+            pass  # Entry might already be removed
+
+    def _add_favorite_model_entry(self, model: str) -> None:
+        """Add a new favorite model entry."""
+        favorite_container = self.query_one("#favorite-models-container", Vertical)
+        entry_id = f"favorite-model-{len(favorite_container.children)}"
+
+        # Create the new entry using mount with multiple widgets
+        # Store the model name in a data attribute for easy retrieval
+        label_widget = Label(model, id=f"{entry_id}-label")
+        label_widget.model_name = model  # Store original model name as custom attribute
+
+        favorite_container.mount(
+            Horizontal(
+                label_widget,
+                Button("−", id=f"{entry_id}-remove", variant="error"),
+            )
+        )
+
+    def _remove_favorite_model_entry(self, entry_id: str) -> None:
+        """Remove a favorite model entry."""
+        try:
+            entry = self.query_one(f"#{entry_id}", Horizontal)
+            entry.remove()
+        except:
+            pass  # Entry might already be removed
+
+    def _load_favorite_models(self) -> None:
+        """Load favorite models into the UI."""
+        favorite_models = self.settings.get("favoriteModels", [])
+        favorite_container = self.query_one("#favorite-models-container", Vertical)
+        favorite_container.remove_children()
+
+        for model in favorite_models:
+            self._add_favorite_model_entry(model)
+
+    def _update_available_models_select(self) -> None:
+        """Update the available models select with all models except favorites."""
+        try:
+            # Get all available models from the app
+            app = self.app
+            if hasattr(app, "available_models") and app.available_models:
+                all_models = app.available_models
+            else:
+                # Fallback to a basic list if available_models is not ready
+                all_models = []
+
+            # Get current favorites
+            favorite_models = self.settings.get("favoriteModels", [])
+
+            # Filter out favorites from available models
+            available_models = [
+                model for model in all_models if model not in favorite_models
+            ]
+
+            # Update the select options
+            model_options = [(model, model) for model in available_models]
+            select = self.query_one("#available-models-select", Select)
+            select.set_options(model_options)
+        except Exception:
+            pass  # Ignore errors if widgets aren't ready yet
+
+    def _clear_mcp_form(self) -> None:
+        """Clear the MCP server form."""
+        self.query_one("#mcp-server-name-input", Input).value = ""
+        self.query_one("#mcp-server-command-input", Input).value = ""
+        self.query_one("#mcp-server-args-input", Input).value = ""
+
+        # Clear environment variables
+        env_container = self.query_one("#mcp-env-container", Vertical)
+        env_container.remove_children()
+
+        self.query_one("#mcp-server-enabled-switch", Switch).value = True
+        self.query_one("#mcp-container-enabled-switch", Switch).value = False
+        self.query_one("#mcp-container-engine-select", Select).value = "none"
+        self.query_one("#mcp-container-image-input", Input).value = ""
+        self.query_one("#mcp-container-mount-input", Input).value = "/home/agent"
+        self.query_one("#mcp-container-sandbox-switch", Switch).value = False
+
+
 class ChatApp(App):
     """A textual-based chat interface for a smolagents agent."""
 
@@ -318,12 +1163,82 @@ class ChatApp(App):
         align: center middle;
     }
 
+    #settings-dialog {
+        background: $surface;
+        padding: 1 2;
+        border: thick $accent;
+        width: 100%;
+        height: 75;
+        align: center middle;
+    }
+
     .dialog-title {
         align: center top;
         width: 100%;
         margin-bottom: 1;
         text-style: bold;
         color: $primary;
+    }
+
+    #settings-tabs {
+        height: 1fr;
+        margin-bottom: 0;
+    }
+
+    #settings-buttons {
+        height: auto;
+        dock: bottom;
+        padding: 1;
+    }
+
+    #settings-buttons Button {
+        margin: 0 1;
+    }
+
+    Label {
+        color: $foreground;
+        margin-top: 0;
+        margin-bottom: 0;
+    }
+
+    .switch-label {
+        margin-top: 0;
+        margin-left: 1;
+    }
+
+    #general-settings, #endpoints-settings, #mcp-settings, #containers-settings {
+        padding: 1;
+        height: 1fr;
+        overflow-y: auto;
+    }
+
+    #endpoint-details, #mcp-server-details {
+        margin-top: 1;
+        padding: 1;
+        border: solid $primary 30%;
+    }
+
+    #container-settings {
+        margin-top: 1;
+        padding: 1;
+        border: solid $secondary 30%;
+    }
+
+    TextArea {
+        height: 2;
+        margin-bottom: 1;
+    }
+
+    Select {
+        margin-bottom: 1;
+    }
+
+    Input {
+        margin-bottom: 1;
+    }
+
+    Switch {
+        margin-right: 1;
     }
 
     #model-select OptionList {
@@ -888,6 +1803,63 @@ class ChatApp(App):
         except Exception as e:
             logging.error(f"Error saving settings: {e}", exc_info=True)
 
+    def _clean_settings_for_json(self, settings: dict) -> dict:
+        """Clean settings to ensure they are JSON serializable."""
+        import copy
+
+        def clean_value(value):
+            # Check if it's a NoSelection object by type name
+            if (
+                hasattr(value, "__class__")
+                and value.__class__.__name__ == "NoSelection"
+            ):
+                return None
+            elif isinstance(value, dict):
+                return {k: clean_value(v) for k, v in value.items()}
+            elif isinstance(value, list):
+                return [clean_value(item) for item in value]
+            else:
+                return value
+
+        return clean_value(copy.deepcopy(settings))
+
+    @work(exclusive=True, thread=True)
+    def _save_settings_worker(self, settings_snapshot: dict) -> None:
+        """Background worker to save settings atomically and safely.
+
+        Runs in a thread so UI stays responsive per Textual Workers guide.
+        """
+        try:
+            settings_path = self.config_dir / "settings.json"
+            tmp_path = settings_path.with_suffix(".tmp")
+
+            # Clean settings to ensure JSON serialization
+            clean_settings = self._clean_settings_for_json(settings_snapshot)
+
+            # Write atomically
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(clean_settings, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+
+            tmp_path.replace(settings_path)
+        except Exception as e:
+            logging.error(f"Worker save settings failed: {e}", exc_info=True)
+
+    def _load_settings_from_file(self):
+        """Reload settings from settings.json file."""
+        try:
+            settings_path = self.config_dir / "settings.json"
+            if settings_path.exists():
+                with open(settings_path, "r", encoding="utf-8") as f:
+                    loaded_settings = json.load(f)
+                    # Update the current settings with the loaded ones
+                    self.settings.update(loaded_settings)
+            else:
+                logging.warning("settings.json file not found during reload")
+        except Exception as e:
+            logging.error(f"Error loading settings from file: {e}", exc_info=True)
+
     def delete_session(self, name: str | None):
         """Deletes a saved session file."""
         if name is None:
@@ -1284,6 +2256,9 @@ class ChatApp(App):
             # Pass environment variables to apptainer wrapper
             common_args["env"] = env
             return self._wrap_command_for_apptainer(**common_args)
+        elif engine == "none" or engine is None:
+            # "none" means run on host without container
+            return command, args
         else:
             logging.warning(
                 f"Container engine '{engine}' not supported. Running '{server_name}' on host."
@@ -1295,7 +2270,9 @@ class ChatApp(App):
         import subprocess
 
         try:
-            if engine == "docker":
+            if engine == "none":
+                return True  # "none" is always available
+            elif engine == "docker":
                 result = subprocess.run(
                     ["docker", "--version"],
                     capture_output=True,
@@ -1325,12 +2302,15 @@ class ChatApp(App):
         # Add global container settings if enabled
         global_container_settings = self.settings.get("containers", {})
         if global_container_settings.get("enabled", False):
-            container_configs.add(
-                (
-                    global_container_settings.get("engine", "docker"),
-                    global_container_settings.get("image"),
+            engine = global_container_settings.get("engine", "docker")
+            # Skip "none" engines as they don't need validation
+            if engine not in ["none", None]:
+                container_configs.add(
+                    (
+                        engine,
+                        global_container_settings.get("image"),
+                    )
                 )
-            )
 
         # Add per-server container settings
         for server_name, server_config in server_configs.items():
@@ -1343,7 +2323,10 @@ class ChatApp(App):
             if merged_settings.get("enabled", False):
                 engine = merged_settings.get("engine", "docker")
                 image = merged_settings.get("image")
-                if image:  # Only add if image is specified
+                # Skip "none" engines as they don't need validation
+                if (
+                    engine not in ["none", None] and image
+                ):  # Only add if image is specified
                     container_configs.add((engine, image))
 
         # If no containers are enabled, return True
@@ -2072,6 +3055,7 @@ class ChatApp(App):
                 "/compress",
                 "/dump-context",
                 "/show-settings",
+                "/settings",
                 "/save",
                 "/load",
                 "/delete",
@@ -2172,6 +3156,9 @@ class ChatApp(App):
             return True
         if command == "/show-settings":
             self.show_settings()
+            return True
+        if command == "/settings":
+            self.action_open_settings()
             return True
         return False
 
@@ -2388,16 +3375,19 @@ class ChatApp(App):
             self.is_loading = False
             self.agent_worker = None
 
-            chat_history = self.query_one("#chat-history")
-            # Remove the thinking indicator
-            try:
-                chat_history.query(".agent-thinking").last().remove()
-            except Exception:
-                pass  # It might have already been removed
+    def action_open_settings(self) -> None:
+        """Open the settings screen."""
 
-            self._display_ui_message("Request cancelled.")
-            self.query_one(Input).placeholder = "Ask the agent to do something..."
-            chat_history.scroll_end()
+        def on_settings_saved(settings: dict | None):
+            if settings is not None:
+                # Update the in-memory settings immediately
+                self.settings.update(settings)
+                # Kick off a background save so UI remains responsive
+                # Pass a snapshot so worker isn't tied to mutable dict
+                self._save_settings_worker(dict(self.settings))
+                self._display_ui_message("Settings saving…")
+
+        self.push_screen(SettingsScreen(self.settings), on_settings_saved)
 
     def _count_tokens_with_tiktoken(self, text: str) -> int:
         """Count tokens using tiktoken with cl100k_base encoding (GPT-4/3.5 compatible)."""
@@ -3685,6 +4675,9 @@ sync "{state_file_path}"
             return self._wrap_command_for_apptainer(
                 shell_command, container_settings, state_file_path
             )
+        elif engine == "none" or engine is None:
+            # "none" means run on host without container
+            return command, args
         else:
             # Should not happen if settings are validated, but as a fallback
             logging.warning(
@@ -3832,6 +4825,19 @@ def main():
     log_dir.mkdir(parents=True, exist_ok=True)
     data_dir.mkdir(parents=True, exist_ok=True)
 
+    # Set up logging early to capture all startup messages
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        filename=log_dir / "vibeagent.log",
+        filemode="a",
+    )
+    stdout_logger = logging.getLogger("STDOUT")
+    sys.stdout = StreamToLogger(stdout_logger, logging.INFO)
+    stderr_logger = logging.getLogger("STDERR")
+    sys.stderr = StreamToLogger(stderr_logger, logging.ERROR)
+    logging.info("--- VibeAgent session started, logging to vibeagent.log ---")
+
     # Load settings to get model configuration
     def load_settings(config_dir: Path):
         """Load settings from settings.json with environment variable substitution."""
@@ -3905,18 +4911,6 @@ def main():
     if not model_config.get("endpoints"):
         print("Error: No model endpoints configured in settings.json.")
         sys.exit(1)
-
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        filename=log_dir / "vibeagent.log",
-        filemode="w",
-    )
-    stdout_logger = logging.getLogger("STDOUT")
-    sys.stdout = StreamToLogger(stdout_logger, logging.INFO)
-    stderr_logger = logging.getLogger("STDERR")
-    sys.stderr = StreamToLogger(stderr_logger, logging.ERROR)
-    print("--- VibeAgent session started, logging to vibeagent.log ---")
 
     app = ChatApp(
         model_config=model_config,

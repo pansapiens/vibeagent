@@ -38,6 +38,7 @@ vibeagent
 - `/refresh-models` - Fetches the latest list of available models from configured endpoints.
 - `/compress [strategy]` - Manually compress the conversation history to save tokens. Strategies: `drop_oldest`, `middle_out`, `summarize`.
 - `/dump-context [format]` - Display the agent's current memory. Format can be `markdown` (default) or `json`.
+- `/settings` - Open the interactive settings screen to configure endpoints, MCP servers, containers, and other options.
 - `/show-settings` - Displays the location of configuration files and their current content.
 
 ### Shell Commands
@@ -205,6 +206,27 @@ To build the image locally:
 ```bash
 docker build -t vibeagent-mcp:latest -f mcp.Dockerfile .
 ```
+
+## Developing
+
+To set up a development environment:
+
+```bash
+# Clone the repository
+git clone https://github.com/pansapiens/vibeagent.git
+cd vibeagent
+
+# Create virtual environment and install dependencies
+uv sync
+
+# Install with dev dependencies
+uv pip install -e ".[dev]"
+```
+
+This will:
+- Create a virtual environment using `uv sync`
+- Install all project dependencies
+- Install the package in editable mode with development dependencies (including `textual-dev`)
 
 ##  Monitoring the agent, telemetry
 

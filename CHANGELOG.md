@@ -5,6 +5,7 @@ All notable changes to this project will be documented in this file.
 ## [0.1.1] - 2025-01-XX
 
 ### Added
+- **Interactive Settings Screen**: New `/settings` command opens a comprehensive tabbed interface for editing all application settings
 - **Per-server container settings**: Each MCP server can now have its own container configuration that inherits from global settings
 - **Shell state persistence**: Complete shell state (working directory, environment variables, functions, aliases) is now maintained between `!` commands
 - **Working directory management**: Current directory is automatically set to first allowed path on startup and persists across shell commands
