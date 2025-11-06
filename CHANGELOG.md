@@ -2,6 +2,35 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.0] - 2025-11-06
+
+### Added
+- **Rich UI Framework**: Complete migration from Textual to Rich for beautiful terminal interface
+- **Simplified Architecture**: Streamlined codebase with modular components (ConfigManager, MessageRenderer, InputHandler, etc.)
+- **Enhanced Message Rendering**: Beautiful panels with color-coded message types and markdown support
+- **Input History**: Persistent command history with arrow key navigation via prompt-toolkit
+- **Session Management**: Robust session persistence with JSON storage
+- **Progress Indicators**: Visual feedback during agent thinking with Rich progress bars
+- **Command Line Interface**: Full CLI argument support for model, API key, and API base overrides
+- **Comprehensive Testing**: Added comprehensive test suite for all major components
+
+### Changed
+- **UI Framework**: Migrated from Textual TUI framework to Rich terminal rendering library
+- **Dependencies**: Replaced textual and textual-autocomplete with rich and prompt-toolkit
+- **Configuration**: Simplified configuration management with environment variable support
+- **Code Structure**: Modularized codebase into separate, testable components
+- **Command System**: Streamlined command system with focus on core chat functionality
+
+### Removed
+- **Complex Settings UI**: Removed modal configuration dialogs in favor of environment variables and JSON config
+- **Model Selection Dialog**: Simplified to command-line and environment variable configuration
+- **Tabbed Interface**: Removed complex UI components in favor of streamlined chat interface
+
+### Fixed
+- **Terminal Compatibility**: Improved compatibility across different terminal emulators
+- **Performance**: Reduced memory usage and improved rendering performance
+- **Error Handling**: Enhanced error handling and logging throughout the application
+
 ## [0.1.1] - 2025-01-XX
 
 ### Added
@@ -20,6 +49,10 @@ All notable changes to this project will be documented in this file.
 - **Shell state persistence**: Fixed issues where working directory, environment variables, functions, and aliases were not properly maintained between `!` commands
 - **State capture format**: Updated to use `###! SECTION !###` format for better reliability
 - **Tilde expansion**: Fixed issue where `~` was not expanded to home directory in shell commands
+- **Tools command initialization**: Fixed `/tools` command reporting "tools not initialized" even after MCP servers connect successfully by adding proper startup state checking
+- **Models endpoint errors**: Changed `/models` endpoint failures from errors to warnings during startup, since not all providers implement this endpoint
+- **Fallback model support**: Added support for models configured in favorites, defaultModel, or --model even when not found in provider's /models endpoint
+- **Default provider fallback**: Added support for marking a provider as "default": true in settings to use as fallback for configured models
 
 ## [0.1.0] - 2025-07-19
 

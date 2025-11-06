@@ -1,13 +1,19 @@
 # vibeagent
 
-A terminal friendly LLM chat interface.
+![warning: vibe coded](https://img.shields.io/badge/warning-vibe_coded-orange?logo=googlegemini&logoColor=orange)
+
+A terminal-based LLM chat interface built with Rich.
 
 Features:
 
-- MCP tool support
-- Multiple OpenAI-compatible API endpoints (openrouter, and your local ollama/llama-swap)
-- Context management
-- Monitoring and telemetry via arize-phoenix, in-app context dump
+- **Rich UI** - Beautiful terminal interface using Rich library
+- **MCP tool support** - Model Context Protocol for extensible tools
+- **Multiple OpenAI-compatible API endpoints** (openrouter, ollama, local servers)
+- **Context management** - Intelligent conversation history handling
+- **Session persistence** - Save and restore conversations
+- **Input history** - Command history with arrow key navigation
+- **Markdown rendering** - Rich text display with syntax highlighting
+- **Monitoring and telemetry** - Via arize-phoenix, in-app context dump
 
 > NOTE WELL: The default configuration has access to your filesystem and has the ability to cause data loss and maybe worse. You have been warned.
 
@@ -32,15 +38,44 @@ vibeagent
 
 ### Commands
 
-- `/tools` - List available tools
-- `/quit` - Quit the agent
-- `/model [name]` - Change the model. If `[name]` is omitted, a selection dialog is shown.
-- `/refresh-models` - Fetches the latest list of available models from configured endpoints.
-- `/compress [strategy]` - Manually compress the conversation history to save tokens. Strategies: `drop_oldest`, `middle_out`, `summarize`.
-- `/dump-context [format]` - Display the agent's current memory. Format can be `markdown` (default) or `json`.
-- `/settings` - Open the interactive settings screen to configure endpoints, MCP servers, containers, and other options.
-- `/settings json` - Open a raw JSON editor for editing the settings.json file directly.
-- `/show-settings` - Displays the location of configuration files and their current content.
+- `/help` - Show available commands and help information
+- `/quit` or `/exit` - Exit the application
+- `/clear` - Clear the chat history
+- `/save [name]` - Save current session (optional custom name)
+- `/load [name]` - Load a session (shows previous if no name)
+- `/delete <name>` - Delete a saved session
+- `/tools` - List available tools from MCP servers
+- `/model [model]` - Change model or show current model
+- `/refresh-models` - Refresh model list from API
+- `/compress [strategy]` - Compress context (drop_oldest, middle_out, summarize)
+- `/dump-context [format]` - Show agent's current memory (markdown/json)
+- `/show-settings` - Show configuration file locations and content
+- `/status` - Show current status and configuration
+
+### Autocompletion
+
+The interface supports smart autocompletion with Tab key:
+
+- **Commands**: Tab to complete `/help`, `/save`, `/load`, etc.
+- **Arguments**: After typing a command, Tab shows available options
+  - `/model <Tab>` - Shows available models
+  - `/compress <Tab>` - Shows compression strategies
+  - `/save <Tab>` - Shows existing session names
+
+### Configuration
+
+The app uses environment variables and JSON configuration files:
+
+```bash
+# Set model via environment variable
+export VIBEAGENT_MODEL="openrouter://anthropic/claude-3.5-sonnet"
+
+# Set API key
+export OPENAI_API_KEY="your-api-key-here"
+
+# Or use command line arguments
+vibeagent --model "openai:gpt-4o-mini" --api-key-env-var "OPENAI_API_KEY"
+```
 
 ### Shell Commands
 

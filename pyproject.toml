@@ -7,17 +7,15 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "smolagents[litellm,mcp,telemetry,toolkit]",
-    "textual[syntax]",
+    "rich",
+    "prompt-toolkit",
     "python-dotenv",
     "aider-chat",
     "openai",
-    "textual-autocomplete",
     "platformdirs",
     "tiktoken",
 ]
 
-[project.optional-dependencies]
-dev = ["textual-dev"]
 
 [project.scripts]
 vibeagent = "vibeagent:main"
