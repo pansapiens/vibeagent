@@ -991,7 +991,21 @@ class RichChatApp:
             mcp_table.add_column("Status", style="white", width=12)
             mcp_table.add_column("Command", style="dim", min_width=30, overflow="fold")
 
+            # Sort servers: enabled first, then disabled
+            enabled_servers = []
+            disabled_servers = []
+
             for server_name, server_config in mcp_servers.items():
+                enabled = server_config.get("enabled", False)
+                if enabled:
+                    enabled_servers.append((server_name, server_config))
+                else:
+                    disabled_servers.append((server_name, server_config))
+
+            # Process enabled servers first, then disabled
+            sorted_servers = enabled_servers + disabled_servers
+
+            for server_name, server_config in sorted_servers:
                 enabled = server_config.get("enabled", False)
                 status = "✅ Enabled" if enabled else "❌ Disabled"
                 command = server_config.get("command", "N/A")
@@ -1266,6 +1280,8 @@ class RichChatApp:
                 # Handle commands
                 if self.handle_command(user_input):
                     if not self.running:  # /quit was called
+                        # Clean up before breaking
+                        self.cleanup()
                         break
                     continue
 
@@ -1279,14 +1295,57 @@ class RichChatApp:
             except KeyboardInterrupt:
                 self.console.print("\n[yellow]Use /quit to exit.[/yellow]")
             except EOFError:
+                # Clean up on Ctrl+D
+                self.console.print("\n[yellow]Received EOF. Exiting...[/yellow]")
+                self.cleanup()
                 break
             except Exception as e:
                 get_logger().error(f"Unexpected error: {e}")
                 self.console.print(f"[red]Error: {e}[/red]")
+                # Clean up even on error
+                self.cleanup()
+                break
 
         # Save session on exit
         self.session_manager.save_session()
         self.console.print("\n[bold green]Goodbye! 👋[/bold green]")
+
+        # Clean up terminal state
+        self.cleanup()
+
+    def cleanup(self):
+        """Clean up terminal state and resources."""
+        try:
+            # Stop Live display if running
+            if self.live:
+                self.live.stop()
+                self.live = None
+
+            # Clean up prompt-toolkit session
+            if hasattr(self.input_handler, 'session') and self.input_handler.session:
+                try:
+                    self.input_handler.session.app.exit()
+                except:
+                    pass  # Ignore cleanup errors
+
+            # Reset Rich console
+            self.console.clear()
+            self.console.show_cursor(True)
+
+            # Reset terminal attributes (without clearing screen)
+            sys.stdout.write('\033[0m')  # Reset all attributes
+            sys.stdout.write('\033[?25h')  # Ensure cursor is visible
+            sys.stdout.write('\n')  # Move to new line
+            sys.stdout.flush()
+
+        except Exception as e:
+            # If cleanup fails, just try a basic reset
+            try:
+                sys.stdout.write('\033[0m')  # Reset all attributes
+                sys.stdout.write('\033[?25h')  # Ensure cursor is visible
+                sys.stdout.flush()
+            except:
+                pass
 
 
 def main():
@@ -1331,6 +1390,7 @@ def main():
     # Load environment variables
     load_dotenv()
 
+    app = None
     try:
         app = RichChatApp()
 
@@ -1352,9 +1412,13 @@ def main():
         app.run()
 
     except KeyboardInterrupt:
+        if app:
+            app.cleanup()
         print("\nGoodbye! 👋")
         sys.exit(0)
     except Exception as e:
+        if app:
+            app.cleanup()
         get_logger().error(f"Fatal error: {e}")
         sys.exit(1)
 
