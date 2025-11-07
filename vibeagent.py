@@ -987,15 +987,25 @@ class RichChatApp:
         mcp_servers = self.config_manager.settings.get("mcpServers", {})
         if mcp_servers:
             mcp_table = Table(title="MCP Servers Configuration", show_header=True, header_style="bold blue")
-            mcp_table.add_column("Server", style="green")
-            mcp_table.add_column("Status", style="white")
-            mcp_table.add_column("Command", style="dim")
+            mcp_table.add_column("Server", style="green", min_width=15)
+            mcp_table.add_column("Status", style="white", width=12)
+            mcp_table.add_column("Command", style="dim", min_width=30, overflow="fold")
 
             for server_name, server_config in mcp_servers.items():
                 enabled = server_config.get("enabled", False)
                 status = "✅ Enabled" if enabled else "❌ Disabled"
                 command = server_config.get("command", "N/A")
-                mcp_table.add_row(server_name, status, command)
+                args = server_config.get("args", [])
+
+                # Combine command and args for full command display
+                if command != "N/A" and args:
+                    full_command = f"{command} {' '.join(args)}"
+                elif command != "N/A":
+                    full_command = command
+                else:
+                    full_command = "N/A"
+
+                mcp_table.add_row(server_name, status, full_command)
 
             self.console.print(mcp_table)
         else:
