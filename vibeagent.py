@@ -28,10 +28,13 @@ from datetime import datetime
 from functools import partial
 from pathlib import Path
 from dotenv import load_dotenv
+
+# MCP imports
+from mcp import StdioServerParameters
+from smolagents import ToolCallingAgent, tool, MCPClient
 from contextlib import redirect_stdout
 import platformdirs
 import tiktoken
-from smolagents import ToolCallingAgent, tool, MCPClient
 from smolagents.models import OpenAIServerModel, MessageRole, ChatMessage, TokenUsage
 from smolagents.monitoring import Timing
 from mcp import StdioServerParameters
@@ -45,6 +48,7 @@ from rich.text import Text
 from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.table import Table
 from rich.syntax import Syntax
+from rich import box
 from rich.prompt import Prompt, Confirm
 from prompt_toolkit import prompt as pt_prompt
 from prompt_toolkit.completion import WordCompleter
@@ -211,7 +215,8 @@ class MessageRenderer:
             border_style=style["border_style"],
             title_align=style["title_align"],
             padding=(0, 1),
-            expand=True
+            expand=True,
+            box=box.HORIZONTALS
         )
 
 
@@ -239,7 +244,7 @@ class InputHandler:
             history=FileHistory(str(self.history_file)),
             completer=self.completer,
             key_bindings=self.key_bindings,
-            multiline=True,
+            multiline=False,
             wrap_lines=True
         )
 
@@ -299,11 +304,9 @@ class InputHandler:
         return sessions
 
     def get_input(self, prompt_text: str = "> ") -> str:
-        """Get user input with prompt-toolkit."""
+        """Get user input with prompt-toolkit and autocompletion."""
         try:
-            # For now, use simple input to avoid potential issues
-            # TODO: Fix dynamic autocompletion in a future version
-            user_input = input(prompt_text)
+            user_input = self.session.prompt(prompt_text)
             return user_input.strip()
         except KeyboardInterrupt:
             return "/quit"
@@ -317,11 +320,18 @@ class AgentManager:
     def __init__(self, config_manager: ConfigManager):
         self.config_manager = config_manager
         self.agent = None
-        self.mcp_clients = {}
+        self.mcp_clients = {}  # Store MCPClient objects
+        self.mcp_tools = []   # Store collected MCP tools
         self.agent_initialized = False
         self.agent_error = None
         self.model_details = {}
         self.available_models = []
+
+        # Initialize built-in tools
+        self.built_in_tools = self._create_built_in_tools()
+
+        # Initialize MCP servers first
+        self.initialize_mcp_servers()
 
         # Initialize agent (but don't block on API calls)
         self.initialize_agent()
@@ -401,6 +411,111 @@ class AgentManager:
             return os.environ[value[1:]]
         return value
 
+    def _create_built_in_tools(self):
+        """Create built-in tools for the agent."""
+        @tool
+        def aider_edit_file(file: str, instruction: str) -> str:
+            """
+            Edits a file using the aider tool with a given instruction.
+            Args:
+                file: The path to the file to edit.
+                instruction: The instruction message to pass to aider for the edit.
+            """
+            output_capture = io.StringIO()
+            try:
+                # Get current model details
+                current_model = self.config_manager.get("defaultModel", "openai:gpt-4")
+                model_details = self.model_details.get(current_model)
+                if not model_details:
+                    return f"Error: Could not find model details for {current_model}. Cannot run aider."
+
+                with redirect_stdout(output_capture):
+                    # Import aider dependencies here to avoid circular dependencies
+                    from aider.coders import Coder
+                    from aider.models import Model
+
+                    # Setup model and coder
+                    model = Model(model_details["original_id"])
+                    coder = Coder.create(
+                        main_model=model,
+                        fnames=[file] if file else None,
+                        show_diffs=False,
+                        auto_commits=False,
+                        pretty_output=False,
+                    )
+
+                    # Run the edit instruction
+                    coder.run(instruction)
+
+                captured_output = output_capture.getvalue()
+                return f"Aider edit completed:\n{captured_output}"
+
+            except Exception as e:
+                return f"Error running aider: {str(e)}\nCaptured output:\n{output_capture.getvalue()}"
+
+        return [aider_edit_file]
+
+    def initialize_mcp_servers(self):
+        """Initialize MCP servers and collect their tools."""
+        try:
+            logger.info("Initializing MCP servers...")
+
+            server_configs = self.config_manager.settings.get("mcpServers", {})
+            logger.info(f"Found {len(server_configs)} MCP server configurations.")
+
+            if not server_configs:
+                logger.info("No MCP servers configured")
+                return
+
+            for name, config in server_configs.items():
+                logger.info(f"Processing MCP server config: {name}")
+
+                # Skip disabled servers
+                if not config.get("enabled", True):
+                    logger.info(f"Skipping disabled MCP server: {name}")
+                    continue
+
+                command = config.get("command")
+                args = config.get("args", [])
+                env = config.get("environment", config.get("env", {}))
+
+                if not command:
+                    logger.warning(f"No command specified for MCP server: {name}")
+                    continue
+
+                # Prepare environment
+                full_env = {**os.environ, **env}
+
+                try:
+                    # Create server parameters
+                    server_param = StdioServerParameters(
+                        command=command,
+                        args=args,
+                        env=full_env,
+                    )
+
+                    logger.info(f"[{name}] Creating MCPClient...")
+                    client = MCPClient([server_param])
+
+                    # Store the client
+                    self.mcp_clients[name] = client
+
+                    logger.info(f"[{name}] Getting tools from server...")
+                    server_tools = client.get_tools()
+                    logger.info(f"[{name}] Found {len(server_tools)} tools.")
+
+                    # Add to our tools list
+                    self.mcp_tools.extend(server_tools)
+
+                except Exception as e:
+                    logger.error(f"[{name}] Failed to initialize MCP server: {e}")
+                    continue
+
+            logger.info(f"MCP initialization complete. Collected {len(self.mcp_tools)} tools from {len(self.mcp_clients)} servers.")
+
+        except Exception as e:
+            logger.error(f"Error during MCP server initialization: {e}")
+
     def _create_agent_for_model(self, model_id: str):
         """Create agent for specific model."""
         if model_id not in self.model_details:
@@ -417,15 +532,28 @@ class AgentManager:
             temperature=self.config_manager.get("temperature", 0.7)
         )
 
-        # Create agent with basic tools
+        # Collect all tools: built-in + MCP
+        all_tools = []
+
+        # Add built-in tools
+        if hasattr(self, 'built_in_tools') and self.built_in_tools:
+            all_tools.extend(self.built_in_tools)
+            logger.info(f"Added {len(self.built_in_tools)} built-in tools")
+
+        # Add MCP tools
+        if hasattr(self, 'mcp_tools') and self.mcp_tools:
+            all_tools.extend(self.mcp_tools)
+            logger.info(f"Added {len(self.mcp_tools)} MCP tools from {len(self.mcp_clients)} servers")
+
+        # Create agent with all tools
         self.agent = ToolCallingAgent(
             model=model,
-            tools=[],
+            tools=all_tools,
             max_steps=10,
             verbosity_level=1
         )
 
-        logger.info(f"Created agent for model: {model_id}")
+        logger.info(f"Created agent for model: {model_id} with {len(all_tools)} total tools")
 
     def run_agent(self, user_message: str, callback=None):
         """Run agent with user message."""
@@ -439,8 +567,19 @@ class AgentManager:
                 raise Exception("Agent not available - please check your configuration")
 
         try:
-            # Run the agent
-            response = self.agent.run(user_message)
+            # Intercept smolagents monitoring output to replace "New run" with "Sending..."
+            # Capture stdout to intercept "New run" output
+            captured_output = io.StringIO()
+            with redirect_stdout(captured_output):
+                response = self.agent.run(user_message)
+
+            # Process captured output and replace "New run" with "Sending..."
+            captured_text = captured_output.getvalue()
+            if captured_text.strip():
+                # Replace "New run" with "Sending..." in the captured output
+                modified_text = captured_text.replace("New run", "Sending...")
+                # Print the modified text to our console
+                print(modified_text, end='', flush=True)
 
             if callback:
                 callback(response)
@@ -800,20 +939,36 @@ class RichChatApp:
             self.console.print(f"[red]Session '{session_name}' not found[/red]")
 
     def list_tools(self):
-        """List available tools from MCP servers."""
+        """List available tools from built-in and MCP servers."""
         tools_table = Table(title="Available Tools", show_header=True, header_style="bold green")
         tools_table.add_column("Tool Name", style="cyan")
         tools_table.add_column("Description", style="white")
-        tools_table.add_column("MCP Server", style="magenta")
+        tools_table.add_column("Source", style="magenta")
 
-        # Get tools from agent
-        if self.agent_manager.agent and hasattr(self.agent_manager.agent, 'tools') and self.agent_manager.agent.tools:
-            for tool in self.agent_manager.agent.tools:
+        # Show built-in tools
+        if hasattr(self.agent_manager, 'built_in_tools') and self.agent_manager.built_in_tools:
+            for tool in self.agent_manager.built_in_tools:
                 tool_name = getattr(tool, 'name', str(tool))
                 tool_desc = getattr(tool, 'description', 'No description')
                 tools_table.add_row(tool_name, tool_desc, "Built-in")
-        else:
-            tools_table.add_row("No tools available", "Agent not initialized", "-")
+
+        # Show MCP tools
+        if hasattr(self.agent_manager, 'mcp_tools') and self.agent_manager.mcp_tools:
+            for tool in self.agent_manager.mcp_tools:
+                tool_name = getattr(tool, 'name', str(tool))
+                tool_desc = getattr(tool, 'description', 'No description')
+                tools_table.add_row(tool_name, tool_desc, "MCP")
+
+        # Show agent's current tools (fallback)
+        if (not hasattr(self.agent_manager, 'built_in_tools') or not self.agent_manager.built_in_tools) and \
+           (not hasattr(self.agent_manager, 'mcp_tools') or not self.agent_manager.mcp_tools):
+            if self.agent_manager.agent and hasattr(self.agent_manager.agent, 'tools') and self.agent_manager.agent.tools:
+                for tool in self.agent_manager.agent.tools:
+                    tool_name = getattr(tool, 'name', str(tool))
+                    tool_desc = getattr(tool, 'description', 'No description')
+                    tools_table.add_row(tool_name, tool_desc, "Agent")
+            else:
+                tools_table.add_row("No tools available", "Agent not initialized", "-")
 
         self.console.print(tools_table)
 
@@ -1017,34 +1172,33 @@ class RichChatApp:
             self.live.update(self.render_chat_history())
 
         try:
-            # Show thinking indicator
-            with Progress(
-                SpinnerColumn(),
-                TextColumn("[progress.description]{task.description}"),
-                console=self.console,
-                transient=True,
-            ) as progress:
-                task = progress.add_task("Agent is thinking...", total=None)
+            # Show thinking indicator without interfering with Live display
+            thinking_text = Text("⠋ Agent is thinking...", style="cyan")
+            self.console.print(thinking_text, end="\r")
 
-                # Get agent response
-                response = self.agent_manager.run_agent(user_message)
+            # Get agent response
+            response = self.agent_manager.run_agent(user_message)
 
-                # Add agent response to history
-                if hasattr(response, 'answer'):
-                    self.session_manager.add_message("agent", response.answer)
-                else:
-                    self.session_manager.add_message("agent", str(response))
+            # Clear the thinking indicator
+            self.console.print(" " * len(str(thinking_text)), end="\r")
+            self.console.print()  # Add a newline for proper spacing
 
-                # Handle tool calls if any
-                if hasattr(response, 'tool_calls') and response.tool_calls:
-                    for tool_call in response.tool_calls:
-                        tool_name = tool_call.get("name", "Unknown tool")
-                        tool_args = tool_call.get("arguments", {})
-                        self.session_manager.add_message(
-                            "tool",
-                            f"Called {tool_name} with {tool_args}",
-                            f"Tool: {tool_name}"
-                        )
+            # Add agent response to history
+            if hasattr(response, 'answer'):
+                self.session_manager.add_message("agent", response.answer)
+            else:
+                self.session_manager.add_message("agent", str(response))
+
+            # Handle tool calls if any
+            if hasattr(response, 'tool_calls') and response.tool_calls:
+                for tool_call in response.tool_calls:
+                    tool_name = tool_call.get("name", "Unknown tool")
+                    tool_args = tool_call.get("arguments", {})
+                    self.session_manager.add_message(
+                        "tool",
+                        f"Called {tool_name} with {tool_args}",
+                        f"Tool: {tool_name}"
+                    )
 
         except Exception as e:
             error_msg = f"Error processing message: {str(e)}"
