@@ -1290,6 +1290,11 @@ def main():
     log_dir.mkdir(parents=True, exist_ok=True)
     data_dir.mkdir(parents=True, exist_ok=True)
 
+    # Suppress specific warnings to keep terminal clean
+    import warnings
+    warnings.filterwarnings("ignore", category=FutureWarning, message=".*Parameter 'structured_output' was not specified.*")
+    warnings.filterwarnings("ignore", category=FutureWarning, message=".*Currently it defaults to False, but in version 1.25.*")
+
     # Set up logging early to capture all startup messages
     logging.basicConfig(
         level=logging.INFO,
