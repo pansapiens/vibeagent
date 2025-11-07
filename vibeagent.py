@@ -29,6 +29,24 @@ from functools import partial
 from pathlib import Path
 from dotenv import load_dotenv
 
+
+class StreamToLogger:
+    """
+    Fake file-like stream object that redirects writes to a logger instance.
+    """
+
+    def __init__(self, logger, level):
+        self.logger = logger
+        self.level = level
+        self.encoding = "utf-8"
+
+    def write(self, buf):
+        for line in buf.rstrip().splitlines():
+            self.get_logger().log(self.level, line.rstrip())
+
+    def flush(self):
+        pass
+
 # MCP imports
 from mcp import StdioServerParameters
 from smolagents import ToolCallingAgent, tool, MCPClient
@@ -74,16 +92,9 @@ except ImportError:
     TELEMETRY_AVAILABLE = False
 
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('vibeagent.log'),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger(__name__)
+def get_logger():
+    """Get a properly configured get_logger()."""
+    return logging.getLogger(__name__)
 
 
 class ConfigManager:
@@ -112,7 +123,7 @@ class ConfigManager:
                 with open(self.settings_file, 'r') as f:
                     self.settings = json.load(f)
             except Exception as e:
-                logger.error(f"Error loading settings: {e}")
+                get_logger().error(f"Error loading settings: {e}")
                 self.settings = self._default_settings()
         else:
             self.settings = self._default_settings()
@@ -139,7 +150,7 @@ class ConfigManager:
                 json.dump(self.settings, f, indent=2)
             temp_file.replace(self.settings_file)
         except Exception as e:
-            logger.error(f"Error saving settings: {e}")
+            get_logger().error(f"Error saving settings: {e}")
 
     def get(self, key, default=None):
         """Get setting value."""
@@ -339,14 +350,14 @@ class AgentManager:
     def initialize_agent(self):
         """Initialize the smolagents agent with proper configuration."""
         try:
-            logger.info("Initializing agent with configuration...")
+            get_logger().info("Initializing agent with configuration...")
 
             # Get model configuration
             model_config = self.config_manager.settings
             endpoints = model_config.get("endpoints", {})
             default_model = model_config.get("defaultModel", "openai:gpt-4")
 
-            logger.info(f"Default model: {default_model}")
+            get_logger().info(f"Default model: {default_model}")
 
             # Create fallback model details for configured models
             self._create_fallback_model_details(endpoints, default_model)
@@ -354,15 +365,15 @@ class AgentManager:
             # Initialize agent with default model if available
             if default_model in self.model_details:
                 self._create_agent_for_model(default_model)
-                logger.info(f"Agent initialized with model: {default_model}")
+                get_logger().info(f"Agent initialized with model: {default_model}")
             else:
-                logger.warning(f"Model details not found for {default_model}, agent will be initialized on demand")
+                get_logger().warning(f"Model details not found for {default_model}, agent will be initialized on demand")
 
             self.agent_initialized = True
             return True
 
         except Exception as e:
-            logger.error(f"Error initializing agent: {e}")
+            get_logger().error(f"Error initializing agent: {e}")
             self.agent_error = str(e)
             self.agent = None
             self.agent_initialized = True
@@ -371,7 +382,7 @@ class AgentManager:
     def _create_fallback_model_details(self, endpoints: dict, default_model: str):
         """Create fallback model details for configured models."""
         if not endpoints:
-            logger.warning("No endpoints configured")
+            get_logger().warning("No endpoints configured")
             return
 
         # Find default provider (marked as default or first enabled)
@@ -388,7 +399,7 @@ class AgentManager:
                     break
 
         if not default_provider:
-            logger.warning("No enabled endpoints found")
+            get_logger().warning("No enabled endpoints found")
             return
 
         default_config = endpoints[default_provider]
@@ -403,7 +414,7 @@ class AgentManager:
                 "api_key": api_key,
                 "api_base": api_base,
             }
-            logger.info(f"Created fallback model details for {default_model} using provider {default_provider}")
+            get_logger().info(f"Created fallback model details for {default_model} using provider {default_provider}")
 
     def _substitute_env_vars(self, value: str) -> str:
         """Substitute environment variables in configuration values."""
@@ -458,21 +469,21 @@ class AgentManager:
     def initialize_mcp_servers(self):
         """Initialize MCP servers and collect their tools."""
         try:
-            logger.info("Initializing MCP servers...")
+            get_logger().info("Initializing MCP servers...")
 
             server_configs = self.config_manager.settings.get("mcpServers", {})
-            logger.info(f"Found {len(server_configs)} MCP server configurations.")
+            get_logger().info(f"Found {len(server_configs)} MCP server configurations.")
 
             if not server_configs:
-                logger.info("No MCP servers configured")
+                get_logger().info("No MCP servers configured")
                 return
 
             for name, config in server_configs.items():
-                logger.info(f"Processing MCP server config: {name}")
+                get_logger().info(f"Processing MCP server config: {name}")
 
                 # Skip disabled servers
                 if not config.get("enabled", True):
-                    logger.info(f"Skipping disabled MCP server: {name}")
+                    get_logger().info(f"Skipping disabled MCP server: {name}")
                     continue
 
                 command = config.get("command")
@@ -480,7 +491,7 @@ class AgentManager:
                 env = config.get("environment", config.get("env", {}))
 
                 if not command:
-                    logger.warning(f"No command specified for MCP server: {name}")
+                    get_logger().warning(f"No command specified for MCP server: {name}")
                     continue
 
                 # Prepare environment
@@ -494,27 +505,27 @@ class AgentManager:
                         env=full_env,
                     )
 
-                    logger.info(f"[{name}] Creating MCPClient...")
+                    get_logger().info(f"[{name}] Creating MCPClient...")
                     client = MCPClient([server_param])
 
                     # Store the client
                     self.mcp_clients[name] = client
 
-                    logger.info(f"[{name}] Getting tools from server...")
+                    get_logger().info(f"[{name}] Getting tools from server...")
                     server_tools = client.get_tools()
-                    logger.info(f"[{name}] Found {len(server_tools)} tools.")
+                    get_logger().info(f"[{name}] Found {len(server_tools)} tools.")
 
                     # Add to our tools list
                     self.mcp_tools.extend(server_tools)
 
                 except Exception as e:
-                    logger.error(f"[{name}] Failed to initialize MCP server: {e}")
+                    get_logger().error(f"[{name}] Failed to initialize MCP server: {e}")
                     continue
 
-            logger.info(f"MCP initialization complete. Collected {len(self.mcp_tools)} tools from {len(self.mcp_clients)} servers.")
+            get_logger().info(f"MCP initialization complete. Collected {len(self.mcp_tools)} tools from {len(self.mcp_clients)} servers.")
 
         except Exception as e:
-            logger.error(f"Error during MCP server initialization: {e}")
+            get_logger().error(f"Error during MCP server initialization: {e}")
 
     def _create_agent_for_model(self, model_id: str):
         """Create agent for specific model."""
@@ -538,12 +549,12 @@ class AgentManager:
         # Add built-in tools
         if hasattr(self, 'built_in_tools') and self.built_in_tools:
             all_tools.extend(self.built_in_tools)
-            logger.info(f"Added {len(self.built_in_tools)} built-in tools")
+            get_logger().info(f"Added {len(self.built_in_tools)} built-in tools")
 
         # Add MCP tools
         if hasattr(self, 'mcp_tools') and self.mcp_tools:
             all_tools.extend(self.mcp_tools)
-            logger.info(f"Added {len(self.mcp_tools)} MCP tools from {len(self.mcp_clients)} servers")
+            get_logger().info(f"Added {len(self.mcp_tools)} MCP tools from {len(self.mcp_clients)} servers")
 
         # Create agent with all tools
         self.agent = ToolCallingAgent(
@@ -553,7 +564,7 @@ class AgentManager:
             verbosity_level=1
         )
 
-        logger.info(f"Created agent for model: {model_id} with {len(all_tools)} total tools")
+        get_logger().info(f"Created agent for model: {model_id} with {len(all_tools)} total tools")
 
     def run_agent(self, user_message: str, callback=None):
         """Run agent with user message."""
@@ -562,7 +573,7 @@ class AgentManager:
             default_model = self.config_manager.get("defaultModel", "openai:gpt-4")
             if default_model in self.model_details:
                 self._create_agent_for_model(default_model)
-                logger.info(f"Agent initialized on-demand with model: {default_model}")
+                get_logger().info(f"Agent initialized on-demand with model: {default_model}")
             else:
                 raise Exception("Agent not available - please check your configuration")
 
@@ -587,7 +598,7 @@ class AgentManager:
             return response
 
         except Exception as e:
-            logger.error(f"Error running agent: {e}")
+            get_logger().error(f"Error running agent: {e}")
             raise
 
 
@@ -605,7 +616,7 @@ class SessionManager:
         self.session_id = str(uuid.uuid4())
         self.chat_history = []
         self.config_manager.set("session_id", self.session_id)
-        logger.info(f"Created new session: {self.session_id}")
+        get_logger().info(f"Created new session: {self.session_id}")
 
     def save_session(self):
         """Save current session to file."""
@@ -627,17 +638,17 @@ class SessionManager:
                 json.dump(session_data, f, indent=2)
             temp_file.replace(session_file)
 
-            logger.info(f"Session saved: {session_file}")
+            get_logger().info(f"Session saved: {session_file}")
 
         except Exception as e:
-            logger.error(f"Error saving session: {e}")
+            get_logger().error(f"Error saving session: {e}")
 
     def load_session(self, session_id: str):
         """Load session from file."""
         session_file = self.config_manager.sessions_dir / f"{session_id}.json"
 
         if not session_file.exists():
-            logger.error(f"Session file not found: {session_file}")
+            get_logger().error(f"Session file not found: {session_file}")
             return False
 
         try:
@@ -652,11 +663,11 @@ class SessionManager:
                 # TODO: Implement memory restoration
                 pass
 
-            logger.info(f"Session loaded: {self.session_id}")
+            get_logger().info(f"Session loaded: {self.session_id}")
             return True
 
         except Exception as e:
-            logger.error(f"Error loading session: {e}")
+            get_logger().error(f"Error loading session: {e}")
             return False
 
     def add_message(self, message_type: str, content: str, title: str = None):
@@ -1202,7 +1213,7 @@ class RichChatApp:
 
         except Exception as e:
             error_msg = f"Error processing message: {str(e)}"
-            logger.error(error_msg)
+            get_logger().error(error_msg)
             self.session_manager.add_message("error", error_msg)
 
         # Update display
@@ -1260,7 +1271,7 @@ class RichChatApp:
             except EOFError:
                 break
             except Exception as e:
-                logger.error(f"Unexpected error: {e}")
+                get_logger().error(f"Unexpected error: {e}")
                 self.console.print(f"[red]Error: {e}[/red]")
 
         # Save session on exit
@@ -1270,6 +1281,27 @@ class RichChatApp:
 
 def main():
     """Main entry point."""
+    # Set up platform-specific directories
+    APP_NAME = "vibeagent"
+    config_dir = Path(platformdirs.user_config_dir(APP_NAME))
+    log_dir = Path(platformdirs.user_log_dir(APP_NAME))
+    data_dir = Path(platformdirs.user_data_dir(APP_NAME))
+    config_dir.mkdir(parents=True, exist_ok=True)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    # Set up logging early to capture all startup messages
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        filename=log_dir / "vibeagent.log",
+        filemode="a",
+    )
+
+    # Log session start
+    logger = logging.getLogger(__name__)
+    get_logger().info("--- VibeAgent session started, logging to vibeagent.log ---")
+
     parser = argparse.ArgumentParser(description="vibeagent - Rich Chat Interface")
     parser.add_argument("--model", help="Override model setting")
     parser.add_argument("--api-key-env-var", help="Environment variable containing API key")
@@ -1308,7 +1340,7 @@ def main():
         print("\nGoodbye! 👋")
         sys.exit(0)
     except Exception as e:
-        logger.error(f"Fatal error: {e}")
+        get_logger().error(f"Fatal error: {e}")
         sys.exit(1)
 
 
