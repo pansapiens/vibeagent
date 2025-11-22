@@ -24,6 +24,8 @@ import random
 import string
 import shlex
 import threading
+import subprocess
+import select
 from datetime import datetime
 from functools import partial
 from pathlib import Path
@@ -63,13 +65,13 @@ from rich.live import Live
 from rich.panel import Panel
 from rich.markdown import Markdown
 from rich.text import Text
-from rich.progress import Progress, SpinnerColumn, TextColumn
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn
 from rich.table import Table
 from rich.syntax import Syntax
 from rich import box
 from rich.prompt import Prompt, Confirm
 from prompt_toolkit import prompt as pt_prompt
-from prompt_toolkit.completion import WordCompleter
+from prompt_toolkit.completion import WordCompleter, Completer, Completion
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.formatted_text import HTML
@@ -230,7 +232,40 @@ class MessageRenderer:
             box=box.HORIZONTALS
         )
 
+class CommandCompleter(Completer):
+    """Custom completer for commands and their arguments."""
 
+    def __init__(self, base_commands, model_provider=None, session_provider=None):
+        self.base_commands = base_commands
+        self.model_provider = model_provider
+        self.session_provider = session_provider
+
+    def get_completions(self, document, complete_event):
+        text = document.text_before_cursor
+        
+        # If empty or just starting, complete base commands
+        if " " not in text:
+            for cmd in self.base_commands:
+                if cmd.startswith(text):
+                    yield Completion(cmd, start_position=-len(text))
+            return
+
+        # Check for command arguments
+        parts = text.split(" ", 1)
+        command = parts[0].lower()
+        arg_prefix = parts[1] if len(parts) > 1 else ""
+
+        if command == "/model" and self.model_provider:
+            models = self.model_provider()
+            for model in models:
+                if model.lower().startswith(arg_prefix.lower()):
+                    yield Completion(model, start_position=-len(arg_prefix))
+        
+        elif command in ["/save", "/load", "/delete"] and self.session_provider:
+            sessions = self.session_provider()
+            for session in sessions:
+                if session.lower().startswith(arg_prefix.lower()):
+                    yield Completion(session, start_position=-len(arg_prefix))
 class InputHandler:
     """Manages user input with history and completion."""
 
@@ -248,8 +283,8 @@ class InputHandler:
             "/dump-context", "/show-settings", "/status"
         ]
 
-        # Dynamic completion that will be updated based on context
-        self.completer = WordCompleter(self.base_commands, ignore_case=True)
+        # Initialize with empty providers, will be set later
+        self.completer = CommandCompleter(self.base_commands)
 
         self.session = PromptSession(
             history=FileHistory(str(self.history_file)),
@@ -258,6 +293,11 @@ class InputHandler:
             multiline=False,
             wrap_lines=True
         )
+
+    def set_providers(self, model_provider=None, session_provider=None):
+        """Set providers for dynamic completion."""
+        self.completer.model_provider = model_provider
+        self.completer.session_provider = session_provider
 
     def setup_key_bindings(self):
         """Setup custom key bindings."""
@@ -286,20 +326,17 @@ class InputHandler:
                 sessions = self._get_session_names()
                 return [f"{command} {session}" for session in sessions]
             elif command == "/model":
-                # Suggest common models
-                models = [
-                    "openai:gpt-4o",
-                    "openai:gpt-4o-mini",
-                    "openai:gpt-3.5-turbo",
-                    "anthropic:claude-3-5-sonnet-20241022",
-                    "ollama:llama3.1"
-                ]
+                # Suggest available models
+                models = self.config_manager.get("available_models", []) or []
+                # Also try to get from agent manager if possible (circular dependency issue otherwise)
+                # For now, we'll rely on what's in settings or hardcoded common ones if empty
+
                 return [f"/model {model}" for model in models]
             elif command == "/compress":
                 strategies = ["drop_oldest", "middle_out", "summarize"]
                 return [f"/compress {strategy}" for strategy in strategies]
             elif command == "/dump-context":
-                formats = ["markdown", "json"]
+                formats = ["markdown", "json", "text"]
                 return [f"/dump-context {fmt}" for fmt in formats]
 
         return []
@@ -325,6 +362,114 @@ class InputHandler:
             return "/quit"
 
 
+
+class ShellSession:
+    """Manages a persistent shell session."""
+
+    def __init__(self):
+        self.process = None
+        self.delimiter = f"VIBEAGENT_END_{uuid.uuid4().hex[:8]}"
+        self._initialize_session()
+
+    def _initialize_session(self):
+        """Start the persistent bash process."""
+        try:
+            self.process = subprocess.Popen(
+                ["/bin/bash"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,  # Line buffered
+                preexec_fn=os.setsid  # New session group
+            )
+            os.set_blocking(self.process.stdout.fileno(), False)
+            os.set_blocking(self.process.stderr.fileno(), False)
+            get_logger().info("Started persistent shell session")
+        except Exception as e:
+            get_logger().error(f"Failed to start shell session: {e}")
+
+    def run_command(self, command: str) -> tuple[str, int]:
+        """Run a command in the persistent shell and return output and exit code."""
+        if not self.process or self.process.poll() is not None:
+            self._initialize_session()
+
+        if not self.process:
+            return "Error: Shell session not active", 1
+
+        try:
+            # Prepare command with delimiter to detect end
+            full_command = f"{command}; echo; echo '{self.delimiter}':$?\n"
+            
+            # Write to stdin
+            self.process.stdin.write(full_command)
+            self.process.stdin.flush()
+
+            output_lines = []
+            stdout_buffer = ""
+            stderr_buffer = ""
+            exit_code = 0
+            
+            while True:
+                reads = [self.process.stdout.fileno(), self.process.stderr.fileno()]
+                ret = select.select(reads, [], [], 0.1)
+
+                if not ret[0]:
+                    if self.process.poll() is not None:
+                        break
+                    continue
+
+                for fd in ret[0]:
+                    if fd == self.process.stdout.fileno():
+                        try:
+                            chunk = os.read(fd, 4096).decode('utf-8', errors='replace')
+                        except OSError:
+                            chunk = ""
+                            
+                        if not chunk:
+                            break
+                        
+                        stdout_buffer += chunk
+                        while '\n' in stdout_buffer:
+                            line, stdout_buffer = stdout_buffer.split('\n', 1)
+                            if self.delimiter in line:
+                                try:
+                                    _, code = line.strip().split(":")
+                                    exit_code = int(code)
+                                except ValueError:
+                                    pass
+                                return "".join(output_lines), exit_code
+                            output_lines.append(line + '\n')
+                    
+                    elif fd == self.process.stderr.fileno():
+                        try:
+                            chunk = os.read(fd, 4096).decode('utf-8', errors='replace')
+                        except OSError:
+                            chunk = ""
+                            
+                        if chunk:
+                            stderr_buffer += chunk
+                            while '\n' in stderr_buffer:
+                                line, stderr_buffer = stderr_buffer.split('\n', 1)
+                                output_lines.append(line + '\n')
+
+            return "".join(output_lines), exit_code
+
+        except Exception as e:
+            get_logger().error(f"Error running shell command: {e}")
+            return f"Error: {str(e)}", 1
+
+    def close(self):
+        """Close the shell session."""
+        if self.process:
+            try:
+                self.process.terminate()
+                self.process.wait(timeout=1)
+            except:
+                self.process.kill()
+            self.process = None
+
+
 class AgentManager:
     """Manages agent initialization and communication."""
 
@@ -347,10 +492,49 @@ class AgentManager:
         # Initialize agent (but don't block on API calls)
         self.initialize_agent()
 
+    def fetch_models(self):
+        """Fetch available models from configured endpoints."""
+        from openai import OpenAI
+        
+        endpoints = self.config_manager.settings.get("endpoints", {})
+        if not endpoints:
+            return
+
+        for provider_name, config in endpoints.items():
+            if not config.get("enabled", True):
+                get_logger().info(f"Skipping disabled endpoint: {provider_name}")
+                continue
+                
+            try:
+                api_key = self._substitute_env_vars(config.get("api_key", ""))
+                api_base = config.get("api_base")
+                
+                client = OpenAI(api_key=api_key, base_url=api_base)
+                models = client.models.list()
+                
+                for model in models.data:
+                    model_id = f"{provider_name}:{model.id}"
+                    self.model_details[model_id] = {
+                        "provider": provider_name,
+                        "original_id": model.id,
+                        "api_key": api_key,
+                        "api_base": api_base
+                    }
+                    if model_id not in self.available_models:
+                        self.available_models.append(model_id)
+                        
+                get_logger().info(f"Fetched {len(models.data)} models from {provider_name}")
+                
+            except Exception as e:
+                get_logger().warning(f"Failed to fetch models from {provider_name}: {e}")
+
     def initialize_agent(self):
         """Initialize the smolagents agent with proper configuration."""
         try:
             get_logger().info("Initializing agent with configuration...")
+
+            # Fetch available models first
+            self.fetch_models()
 
             # Get model configuration
             model_config = self.config_manager.settings
@@ -708,6 +892,34 @@ class RichChatApp:
         self.input_handler = InputHandler(self.config_manager)
         self.agent_manager = AgentManager(self.config_manager)
         self.session_manager = SessionManager(self.config_manager, self.agent_manager)
+        self.shell_session = ShellSession()
+
+        # Initialize Telemetry
+        if TELEMETRY_AVAILABLE:
+            try:
+                # Configure Phoenix OTEL
+                register(
+                    project_name="vibeagent",
+                    endpoint="http://localhost:6006/v1/traces"
+                )
+                
+                # Initialize instrumentor
+                SmolagentsInstrumentor().instrument()
+                
+                # Configure tracer provider
+                tracer_provider = TracerProvider()
+                tracer_provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))
+                trace.set_tracer_provider(tracer_provider)
+                
+                get_logger().info("Telemetry initialized successfully")
+            except Exception as e:
+                get_logger().warning(f"Failed to initialize telemetry: {e}")
+
+        # Set providers for autocomplete
+        self.input_handler.set_providers(
+            model_provider=lambda: list(self.agent_manager.model_details.keys()),
+            session_provider=self._get_session_names
+        )
 
         self.running = False
         self.live = None
@@ -718,6 +930,17 @@ class RichChatApp:
             pass  # Session loaded successfully
         else:
             self.session_manager.new_session()
+
+    def _get_session_names(self):
+        """Get list of available session names for autocomplete."""
+        sessions = self.session_manager.list_sessions()
+        # Return both IDs and custom names if available
+        names = []
+        custom_sessions_dir = self.config_manager.app_dir / "custom_sessions"
+        if custom_sessions_dir.exists():
+            for f in custom_sessions_dir.glob("*.json"):
+                names.append(f.stem)
+        return names
 
     def render_chat_history(self):
         """Render the complete chat history."""
@@ -763,53 +986,64 @@ class RichChatApp:
 
         self.console.print(Panel(welcome_text, border_style="cyan"))
 
-    def handle_command(self, command: str) -> bool:
-        """Handle special commands. Returns True if command was handled."""
-        if command.startswith('/'):
-            parts = command.strip().split(" ", 1)
-            cmd = parts[0].lower()
-            arg = parts[1] if len(parts) > 1 else None
+    def _handle_slash_command(self, command: str) -> bool:
+        """Handle slash commands. Returns True if command was handled."""
+        if not command.startswith('/'):
+            return False
 
-            if cmd in ['/quit', '/exit']:
-                self.running = False
-                return True
-            elif cmd == '/help':
-                self.display_help()
-                return True
-            elif cmd == '/clear':
-                self.session_manager.chat_history.clear()
-                self.console.print("[green]Chat history cleared.[/green]")
-                return True
-            elif cmd == '/save':
+        parts = command.strip().split(" ", 1)
+        cmd = parts[0].lower()
+        arg = parts[1] if len(parts) > 1 else None
+
+        if cmd in ['/quit', '/exit']:
+            self.running = False
+            return True
+        elif cmd == '/help':
+            self.display_help()
+            return True
+        elif cmd == '/clear':
+            self.session_manager.chat_history.clear()
+            self.console.print("[green]Chat history cleared.[/green]")
+            return True
+        elif cmd == '/save':
+            if arg:
                 self.handle_save_command(arg)
-                return True
-            elif cmd == '/load':
+            else:
+                self.console.print("[red]Usage: /save <name>[/red]")
+            return True
+        elif cmd == '/load':
+            if arg:
                 self.handle_load_command(arg)
-                return True
-            elif cmd == '/delete':
+            else:
+                self.console.print("[red]Usage: /load <name>[/red]")
+            return True
+        elif cmd == '/delete':
+            if arg:
                 self.handle_delete_command(arg)
-                return True
-            elif cmd == '/tools':
-                self.list_tools()
-                return True
-            elif cmd == '/model':
-                self.handle_model_command(arg)
-                return True
-            elif cmd == '/refresh-models':
-                self.refresh_models()
-                return True
-            elif cmd == '/compress':
-                self.compress_context(arg)
-                return True
-            elif cmd == '/dump-context':
-                self.dump_context(arg)
-                return True
-            elif cmd == '/show-settings':
-                self.show_settings()
-                return True
-            elif cmd == '/status':
-                self.display_status()
-                return True
+            else:
+                self.console.print("[red]Usage: /delete <name>[/red]")
+            return True
+        elif cmd == '/tools':
+            self.list_tools()
+            return True
+        elif cmd == '/model':
+            self.handle_model_command(arg)
+            return True
+        elif cmd == '/refresh-models':
+            self.refresh_models()
+            return True
+        elif cmd == '/compress':
+            self.compress_context(arg)
+            return True
+        elif cmd == '/dump-context':
+            self.dump_context(arg)
+            return True
+        elif cmd == '/show-settings':
+            self.show_settings()
+            return True
+        elif cmd == '/status':
+            self.display_status()
+            return True
 
         return False
 
@@ -1067,10 +1301,19 @@ class RichChatApp:
         self.console.print("[yellow]Model refresh not yet implemented in Rich version[/yellow]")
         self.console.print(f"[cyan]Current model: {self.config_manager.get('model', 'Unknown')}[/cyan]")
 
+    def _count_tokens_with_tiktoken(self, text: str) -> int:
+        """Count tokens using tiktoken with cl100k_base encoding (GPT-4/3.5 compatible)."""
+        try:
+            encoding = tiktoken.get_encoding("cl100k_base")
+            return len(encoding.encode(text))
+        except Exception:
+            # Fallback to rough approximation if tiktoken fails
+            return len(text) // 4
+
     def compress_context(self, strategy: str = None):
         """Compress conversation context."""
         if not strategy:
-            strategy = "drop_oldest"  # Default strategy
+            strategy = "summarize"  # Default strategy
 
         valid_strategies = ["drop_oldest", "middle_out", "summarize"]
         if strategy not in valid_strategies:
@@ -1093,13 +1336,140 @@ class RichChatApp:
                 self.session_manager.chat_history = new_history
                 self.console.print(f"[green]Compressed context: removed {removed_count} middle messages[/green]")
         elif strategy == "summarize":
-            self.console.print("[yellow]Context summarization not yet implemented[/yellow]")
+            if not self.agent_manager.agent:
+                 self.console.print("[red]Agent is not initialized. Cannot summarize.[/red]")
+                 return
+
+            progress_console = Console(file=sys.__stdout__)
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[bold green]Summarizing and compressing context...[/bold green]"),
+                TimeElapsedColumn(),
+                console=progress_console,
+                transient=True,
+            ) as progress:
+                progress.add_task("", total=None)
+                try:
+                    messages = self.agent_manager.agent.write_memory_to_messages()
+                    history_text = "\n".join(
+                        [
+                            f"{m.role.value}: {''.join(c['text'] if isinstance(c, dict) and 'text' in c else str(c) for c in (m.content if isinstance(m.content, list) else [m.content]))}"
+                            for m in messages
+                        ]
+                    )
+                    summary_prompt = f"""
+                    Summarize the following conversation history to retain the full context of the session.
+                    Structure your summary to cover:
+                    1. The START: The user's initial intent and original questions.
+                    2. The MIDDLE: Key steps taken, tools used, and intermediate results or discoveries.
+                    3. The END: The final answer, solution, or current state.
+
+                    CRITICAL REQUIREMENTS:
+                    - DON'T summarize the tools available, but DO summarize which tools were used and why.
+                    - ALWAYS include the actual content of the final_answer.
+                    - If search results were returned, keep the actual results details.
+                    - If the user has been generating code or files, include the final version of the code or final file path(s).
+                    - Preserve any specific constraints or preferences expressed by the user throughout the conversation.
+
+                    Conversation History:
+                    {history_text}
+                    """.strip()
+
+                    # Get current model details to create a summarizer
+                    current_model_id = self.config_manager.get("defaultModel")
+                    if not current_model_id or current_model_id not in self.agent_manager.model_details:
+                        # Fallback to first available if default not found (shouldn't happen if agent is init)
+                        if self.agent_manager.available_models:
+                            current_model_id = self.agent_manager.available_models[0]
+                        else:
+                            raise Exception("No model details available for summarization")
+                    
+                    model_details = self.agent_manager.model_details[current_model_id]
+                
+                    summarizer_model = OpenAIServerModel(
+                        model_id=model_details["original_id"],
+                        api_key=model_details["api_key"],
+                        api_base=model_details["api_base"],
+                    )
+
+                    # Use direct model call
+                    messages = [
+                        ChatMessage(
+                            role=MessageRole.SYSTEM,
+                            content=[
+                                {
+                                    "type": "text",
+                                    "text": "You are a helpful assistant that summarizes conversations.",
+                                }
+                            ],
+                        ),
+                        ChatMessage(
+                            role=MessageRole.USER,
+                            content=[{"type": "text", "text": summary_prompt}],
+                        ),
+                    ]
+
+                    response = summarizer_model.generate(messages)
+                    summary = response.content
+                    if isinstance(summary, list):
+                        summary = "".join(
+                            c.get("text", "")
+                            for c in summary
+                            if isinstance(c, dict) and "text" in c
+                        )
+                    elif isinstance(summary, str):
+                        summary = summary
+                    else:
+                        summary = str(summary)
+
+                    if not summary or summary.strip() == "":
+                        self.console.print("[red]Warning: Summarization returned empty result. Using fallback summary.[/red]")
+                        summary = f"Conversation summary: Previous conversation has been compressed. Key information has been preserved."
+
+                    # Calculate token count
+                    summary_tokens = self._count_tokens_with_tiktoken(summary) if summary else 0
+
+                    # Create a simple summary step
+                    timing = Timing(start_time=time.time())
+                    timing.end_time = time.time()
+
+                    token_usage = TokenUsage(
+                        input_tokens=summary_tokens,
+                        output_tokens=summary_tokens,
+                    )
+
+                    summary_step = ActionStep(
+                        step_number=1,
+                        timing=timing,
+                        model_output=summary,
+                        observations=None,
+                        token_usage=token_usage,
+                    )
+
+                    # Replace agent memory
+                    self.agent_manager.agent.memory.steps = [summary_step]
+                    self.agent_manager.agent.step_number = 2
+                    
+                    self.console.print(f"[green]Context summarized successfully. New summary token count: {summary_tokens}[/green]")
+                    
+                    # Also clear the chat history in the UI/session to reflect the compression
+                    # We'll keep the last message or just a system message saying it was compressed
+                    self.session_manager.chat_history = [
+                        {
+                            "type": "system",
+                            "content": f"Conversation history compressed. Summary:\n{summary}",
+                            "timestamp": datetime.now().isoformat()
+                        }
+                    ]
+
+                except Exception as e:
+                    self.console.print(f"[red]Error during summarization: {e}[/red]")
         else:
             self.console.print("[yellow]Not enough messages to compress[/yellow]")
 
     def dump_context(self, format_type: str = "markdown"):
         """Display agent's current memory/context."""
-        if format_type not in ["markdown", "json"]:
+        if format_type not in ["markdown", "json", "text"]:
             format_type = "markdown"
 
         if format_type == "json":
@@ -1112,6 +1482,20 @@ class RichChatApp:
             }
             context_json = json.dumps(context_data, indent=2)
             self.console.print(Panel(context_json, title="[bold]Agent Context (JSON)[/bold]", border_style="blue"))
+        elif format_type == "text":
+            # Raw text format
+            context_text = f"Agent Context\n\n"
+            context_text += f"Session ID: {self.session_manager.session_id}\n"
+            context_text += f"Model: {self.config_manager.get('model')}\n"
+            context_text += f"Messages: {len(self.session_manager.chat_history)}\n\n"
+            context_text += "Chat History:\n\n"
+            
+            for i, msg in enumerate(self.session_manager.chat_history, 1):
+                msg_type = msg["type"].title()
+                content = msg["content"]
+                context_text += f"[{i}. {msg_type}]\n{content}\n\n"
+            
+            self.console.print(Panel(Text(context_text), title="[bold]Agent Context (Text)[/bold]", border_style="blue"))
         else:
             # Markdown format
             context_md = f"""
@@ -1126,7 +1510,7 @@ class RichChatApp:
 """
             for i, msg in enumerate(self.session_manager.chat_history, 1):
                 msg_type = msg["type"].title()
-                content = msg["content"][:100] + "..." if len(msg["content"]) > 100 else msg["content"]
+                content = msg["content"]
                 context_md += f"### {i}. {msg_type}\n{content}\n\n"
 
             self.console.print(Panel(Markdown(context_md), title="[bold]Agent Context (Markdown)[/bold]", border_style="blue"))
@@ -1155,48 +1539,114 @@ class RichChatApp:
 
         self.console.print(Panel(settings_text, title="[bold]Settings[/bold]", border_style="yellow"))
 
-    def process_shell_command(self, command: str):
+    def _handle_shell_command(self, command: str):
         """Process shell commands starting with !"""
-        import subprocess
-
         try:
             # Remove the ! prefix
             shell_command = command.lstrip().lstrip("!").strip()
 
             # Show what we're running
-            self.session_manager.add_message("system", f"Running shell command: {shell_command}", "Shell Command")
+            self.session_manager.add_message("user", f">!{shell_command}")
+            self.console.print(f"[bold yellow]> !{shell_command}[/bold yellow]")
 
-            # Execute the command
-            result = subprocess.run(
-                shell_command,
-                shell=True,
-                capture_output=True,
-                text=True,
-                timeout=30  # 30 second timeout
-            )
+            # Execute the command via persistent session
+            output, exit_code = self.shell_session.run_command(shell_command)
+            
+            # Store result for redirection
+            self.last_shell_result = {
+                'command': shell_command,
+                'stdout': output, # ShellSession combines stdout/stderr currently, but we can split if needed later or just use output
+                'stderr': "", # ShellSession combines them
+                'exit_code': exit_code
+            }
 
             # Display output
-            if result.stdout:
-                self.session_manager.add_message("tool", result.stdout, f"Output: {shell_command}")
-            if result.stderr:
-                self.session_manager.add_message("error", result.stderr, f"Error: {shell_command}")
+            if output:
+                self.session_manager.add_message("tool", output, f"Output: {shell_command}")
+                self.console.print(Panel(output.strip(), title="Shell Output", border_style="yellow"))
+            
+            if exit_code != 0:
+                error_msg = f"Command exited with code {exit_code}"
+                self.session_manager.add_message("error", error_msg, f"Failed: {shell_command}")
+                self.console.print(f"[red]{error_msg}[/red]")
 
-            if result.returncode != 0:
-                self.session_manager.add_message("error", f"Command failed with exit code {result.returncode}", f"Failed: {shell_command}")
-
-        except subprocess.TimeoutExpired:
-            self.session_manager.add_message("error", "Command timed out after 30 seconds", f"Timeout: {shell_command}")
         except Exception as e:
-            self.session_manager.add_message("error", f"Error executing command: {str(e)}", f"Error: {shell_command}")
+            error_msg = f"Error executing command: {str(e)}"
+            self.session_manager.add_message("error", error_msg, f"Error: {shell_command}")
+            self.console.print(f"[red]{error_msg}[/red]")
 
-    def process_user_message(self, user_message: str):
-        """Process a user message and get agent response."""
-        if not user_message.strip():
-            return
+    def run_agent(self, user_message: str):
+        """Run the agent with a loading spinner."""
+        # Use a separate console writing to sys.__stdout__ to bypass redirection
+        progress_console = Console(file=sys.__stdout__)
+        
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[bold green]Agent is thinking...[/bold green]"),
+            TimeElapsedColumn(),
+            console=progress_console,
+            transient=True
+        ) as progress:
+            progress.add_task("", total=None)
+            return self.agent_manager.run_agent(user_message)
 
-        # Handle shell commands
-        if user_message.startswith("!"):
-            self.process_shell_command(user_message)
+    def _handle_redirect_command(self, user_message: str) -> bool:
+        """Handle redirect commands (!>, !1>, !2>). Returns True if handled."""
+        import re
+        redirect_match = re.match(r"^!\s*([12]?)\s*>", user_message)
+        
+        # Fallback check for simple cases
+        simple_redirect = False
+        if not redirect_match:
+            clean_msg = user_message.replace(" ", "")
+            if clean_msg.startswith(("!>", "!1>", "!2>")):
+                simple_redirect = True
+
+        if not (redirect_match or simple_redirect):
+            return False
+
+        if not hasattr(self, 'last_shell_result') or not self.last_shell_result:
+            self.console.print("[red]No previous shell command to redirect output from.[/red]")
+            return True
+
+        if simple_redirect:
+            # Manual parsing fallback
+            if user_message.lstrip().startswith("!1>"):
+                redirect_type_num = "1"
+                user_comment = user_message.lstrip()[3:].strip()
+            elif user_message.lstrip().startswith("!2>"):
+                redirect_type_num = "2"
+                user_comment = user_message.lstrip()[3:].strip()
+            else: # !>
+                redirect_type_num = ""
+                user_comment = user_message.lstrip()[2:].strip()
+        else:
+            assert redirect_match is not None
+            redirect_type_num = redirect_match.group(1) # "" or "1" or "2"
+            user_comment = user_message[redirect_match.end():].strip()
+        
+        # Construct prompt
+        prompt = f"{user_comment}\n\n" if user_comment else ""
+        prompt += f"Command: {self.last_shell_result['command']}\n"
+        prompt += f"Exit Code: {self.last_shell_result['exit_code']}\n"
+        
+        output = self.last_shell_result['stdout']
+        
+        if redirect_type_num == "" or redirect_type_num == "1":
+                prompt += f"\nOutput:\n{output}\n"
+        
+        # Add to history as a user message with the context
+        self.session_manager.add_message("user", f"{user_message}\n\n[Redirected Output]\n{output}")
+        
+        # Run agent
+        response = self.run_agent(prompt)
+        self._handle_agent_response(response)
+        return True
+
+    def _process_chat_message(self, user_message: str):
+        """Process a regular chat message."""
+        user_message = user_message.strip()
+        if not user_message:
             return
 
         # Add user message to history
@@ -1207,38 +1657,64 @@ class RichChatApp:
             self.live.update(self.render_chat_history())
 
         try:
-            # Show thinking indicator without interfering with Live display
-            thinking_text = Text("⠋ Agent is thinking...", style="cyan")
-            self.console.print(thinking_text, end="\r")
-
             # Get agent response
-            response = self.agent_manager.run_agent(user_message)
-
-            # Clear the thinking indicator
-            self.console.print(" " * len(str(thinking_text)), end="\r")
-            self.console.print()  # Add a newline for proper spacing
-
-            # Add agent response to history
-            if hasattr(response, 'answer'):
-                self.session_manager.add_message("agent", response.answer)
-            else:
-                self.session_manager.add_message("agent", str(response))
-
-            # Handle tool calls if any
-            if hasattr(response, 'tool_calls') and response.tool_calls:
-                for tool_call in response.tool_calls:
-                    tool_name = tool_call.get("name", "Unknown tool")
-                    tool_args = tool_call.get("arguments", {})
-                    self.session_manager.add_message(
-                        "tool",
-                        f"Called {tool_name} with {tool_args}",
-                        f"Tool: {tool_name}"
-                    )
-
+            response = self.run_agent(user_message)
+            self._handle_agent_response(response)
+            return response
+            
         except Exception as e:
-            error_msg = f"Error processing message: {str(e)}"
+            error_msg = f"Error running agent: {str(e)}"
             get_logger().error(error_msg)
             self.session_manager.add_message("error", error_msg)
+            self.console.print(self.message_renderer.render_message("error", error_msg))
+            return None
+
+    def dispatch_message(self, user_input: str) -> bool:
+        """
+        Central message dispatcher.
+        Returns True if the application should continue running, False otherwise.
+        """
+        if not user_input.strip():
+            return True
+
+        # 1. Slash Commands
+        if user_input.startswith("/"):
+            if self._handle_slash_command(user_input):
+                return self.running # _handle_slash_command sets self.running to False on /quit
+
+        # 2. Redirect Commands
+        if user_input.startswith("!"):
+            if self._handle_redirect_command(user_input):
+                return True
+            
+            # 3. Shell Commands (if not a redirect)
+            self._handle_shell_command(user_input)
+            return True
+
+        # 4. Chat Messages
+        self._process_chat_message(user_input)
+        return True
+
+    def _handle_agent_response(self, response):
+        """Handle agent response including tool calls and content display."""
+        if not response:
+            return
+
+        # Handle tool calls if any
+        if hasattr(response, 'tool_calls') and response.tool_calls:
+            for tool_call in response.tool_calls:
+                tool_name = tool_call.get("name", "Unknown tool")
+                tool_args = tool_call.get("arguments", {})
+                self.session_manager.add_message(
+                    "tool",
+                    f"Called {tool_name} with {tool_args}",
+                    f"Tool: {tool_name}"
+                )
+        
+        # Assuming 'response' object has a 'content' attribute for the agent's main message
+        content = getattr(response, 'content', str(response))
+        self.session_manager.add_message("agent", content)
+        self.console.print(self.message_renderer.render_message("agent", content))
 
         # Update display
         if self.live:
@@ -1266,31 +1742,12 @@ class RichChatApp:
                 if not user_input.strip():
                     continue
 
-                # Handle shell commands first (check for both ! and escaped \!)
-                if user_input.startswith("!") or user_input.startswith(r"\!"):
-                    # Remove escape backslash if present
-                    if user_input.startswith(r"\!"):
-                        user_input = "!" + user_input[2:]
-                    self.process_shell_command(user_input)
-                    # Show updated chat history
-                    self.console.print("\n[bold]Updated Chat:[/bold]")
-                    self.console.print(self.render_chat_history())
-                    continue
-
-                # Handle commands
-                if self.handle_command(user_input):
-                    if not self.running:  # /quit was called
-                        # Clean up before breaking
-                        self.cleanup()
-                        break
-                    continue
-
-                # Process regular message
-                self.process_user_message(user_input)
-
-                # Show updated chat history
-                self.console.print("\n[bold]Updated Chat:[/bold]")
-                self.console.print(self.render_chat_history())
+                # Dispatch message
+                if not self.dispatch_message(user_input):
+                    # dispatch_message returns False if we should exit (e.g. /quit)
+                    self.cleanup()
+                    break
+                continue
 
             except KeyboardInterrupt:
                 self.console.print("\n[yellow]Use /quit to exit.[/yellow]")
