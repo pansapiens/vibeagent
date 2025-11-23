@@ -366,16 +366,68 @@ class InputHandler:
 class ShellSession:
     """Manages a persistent shell session."""
 
-    def __init__(self):
+    def __init__(self, config_manager=None):
+        self.config_manager = config_manager
         self.process = None
         self.delimiter = f"VIBEAGENT_END_{uuid.uuid4().hex[:8]}"
         self._initialize_session()
 
+    def get_cwd(self) -> str:
+        """Get current working directory of the shell session."""
+        output, exit_code = self.run_command("pwd")
+        if exit_code == 0:
+            return output.strip()
+        return os.getcwd()
+
     def _initialize_session(self):
         """Start the persistent bash process."""
+        command = ["/bin/bash"]
+        
+        if self.config_manager:
+            containers_config = self.config_manager.get("containers", {})
+            if containers_config.get("enabled", False) and containers_config.get("sandboxBangShellCommands", False):
+                engine = containers_config.get("engine", "apptainer")
+                image = containers_config.get("image")
+                home_mount = containers_config.get("home_mount_point", "/home/agent")
+                allowed_paths = self.config_manager.get("allowedPaths", [os.getcwd()])
+                cwd = os.getcwd()
+
+                if engine == "apptainer" and image:
+                    # Auto-prefix docker:// if likely a registry image
+                    if not any(image.startswith(p) for p in ["docker://", "library://", "shub://", "oras://", "/", "./"]):
+                        image = f"docker://{image}"
+                        
+                    command = ["apptainer", "--silent", "exec", "--cleanenv", "--no-home", "--no-mount", "hostfs"]
+                    for path in allowed_paths:
+                        command.extend(["--bind", path])
+                    command.extend(["--cwd", cwd, image, "/bin/bash"])
+                    get_logger().info(f"Using Apptainer shell: {' '.join(command)}")
+                    
+                elif engine == "docker" and image:
+                    uid = os.getuid()
+                    gid = os.getgid()
+                    
+                    # Mount allowed paths and CWD
+                    mounts = []
+                    paths_to_mount = set(allowed_paths)
+                    paths_to_mount.add(cwd)
+                    
+                    for path in paths_to_mount:
+                        mounts.extend(["-v", f"{path}:{path}"])
+
+                    command = [
+                        "docker", "run", "-i", "--rm",
+                        "-u", f"{uid}:{gid}",
+                        "-w", cwd,
+                    ]
+                    command.extend(mounts)
+                    command.extend([image, "/bin/bash"])
+                    
+                    get_logger().info(f"Using Docker shell: {' '.join(command)}")
+
         try:
             self.process = subprocess.Popen(
-                ["/bin/bash"],
+                command,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -389,7 +441,7 @@ class ShellSession:
         except Exception as e:
             get_logger().error(f"Failed to start shell session: {e}")
 
-    def run_command(self, command: str) -> tuple[str, int]:
+    def run_command(self, command: str, timeout: int = 30) -> tuple[str, int]:
         """Run a command in the persistent shell and return output and exit code."""
         if not self.process or self.process.poll() is not None:
             self._initialize_session()
@@ -409,8 +461,12 @@ class ShellSession:
             stdout_buffer = ""
             stderr_buffer = ""
             exit_code = 0
+            start_time = time.time()
             
             while True:
+                if time.time() - start_time > timeout:
+                    return "".join(output_lines) + f"\nError: Command timed out after {timeout} seconds", 124
+
                 reads = [self.process.stdout.fileno(), self.process.stderr.fileno()]
                 ret = select.select(reads, [], [], 0.1)
 
@@ -476,6 +532,7 @@ class AgentManager:
     def __init__(self, config_manager: ConfigManager):
         self.config_manager = config_manager
         self.agent = None
+        self.shell_session: 'ShellSession | None' = None
         self.mcp_clients = {}  # Store MCPClient objects
         self.mcp_tools = []   # Store collected MCP tools
         self.agent_initialized = False
@@ -648,7 +705,20 @@ class AgentManager:
             except Exception as e:
                 return f"Error running aider: {str(e)}\nCaptured output:\n{output_capture.getvalue()}"
 
-        return [aider_edit_file]
+        @tool
+        def run_shell_command(command: str) -> str:
+            """
+            Run a shell command and return the output.
+            Args:
+                command: The shell command to run.
+            """
+            if not hasattr(self, 'shell_session') or not self.shell_session:
+                return "Error: Shell session not available."
+            
+            output, exit_code = self.shell_session.run_command(command)
+            return f"Exit Code: {exit_code}\nOutput:\n{output}"
+
+        return [aider_edit_file, run_shell_command]
 
     def initialize_mcp_servers(self):
         """Initialize MCP servers and collect their tools."""
@@ -892,7 +962,10 @@ class RichChatApp:
         self.input_handler = InputHandler(self.config_manager)
         self.agent_manager = AgentManager(self.config_manager)
         self.session_manager = SessionManager(self.config_manager, self.agent_manager)
-        self.shell_session = ShellSession()
+        self.shell_session = ShellSession(self.config_manager)
+        
+        # Link shell session to agent manager
+        self.agent_manager.shell_session = self.shell_session
 
         # Initialize Telemetry
         if TELEMETRY_AVAILABLE:
@@ -1282,9 +1355,6 @@ class RichChatApp:
             except Exception as e:
                 self.console.print(f"[red]Error changing model: {e}[/red]")
         else:
-            # Show current model
-            self.console.print(f"[cyan]Current model: {current_model}[/cyan]")
-
             # Show available models from configuration
             if self.agent_manager.model_details:
                 self.console.print("[bold]Available models:[/bold]")
@@ -1295,6 +1365,9 @@ class RichChatApp:
                     self.console.print(f"  {model_id} - {provider}{current_marker}")
             else:
                 self.console.print("[yellow]No models configured[/yellow]")
+
+            # Show current model
+            self.console.print(f"\n[cyan]Current model: {current_model}[/cyan]")
 
     def refresh_models(self):
         """Refresh model list from API (placeholder for now)."""
@@ -1582,13 +1655,25 @@ class RichChatApp:
         
         with Progress(
             SpinnerColumn(),
-            TextColumn("[bold green]Agent is thinking...[/bold green]"),
+            TextColumn("[bold green]{task.description}[/bold green]"),
             TimeElapsedColumn(),
             console=progress_console,
             transient=True
         ) as progress:
-            progress.add_task("", total=None)
-            return self.agent_manager.run_agent(user_message)
+            task = progress.add_task("Agent is thinking...", total=None)
+            
+            # Get CWD inside the spinner
+            progress.update(task, description="Checking environment...")
+            try:
+                cwd = self.shell_session.get_cwd()
+                system_note = f"[System Note: Current Working Directory is {cwd}]"
+                full_message = f"{system_note}\n\n{user_message}"
+            except Exception as e:
+                get_logger().warning(f"Failed to get CWD: {e}")
+                full_message = user_message
+
+            progress.update(task, description="Agent is thinking...")
+            return self.agent_manager.run_agent(full_message)
 
     def _handle_redirect_command(self, user_message: str) -> bool:
         """Handle redirect commands (!>, !1>, !2>). Returns True if handled."""
