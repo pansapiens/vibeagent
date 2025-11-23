@@ -1667,9 +1667,23 @@ class RichChatApp:
             try:
                 cwd = self.shell_session.get_cwd()
                 system_note = f"[System Note: Current Working Directory is {cwd}]"
-                full_message = f"{system_note}\n\n{user_message}"
+                
+                # Build context from chat history
+                context_str = ""
+                if self.session_manager.chat_history:
+                    # Exclude the current message which was just added
+                    history_to_include = self.session_manager.chat_history[:-1]
+                    if history_to_include:
+                        context_str = "Previous conversation history:\n"
+                        for msg in history_to_include:
+                            role = msg["type"].upper()
+                            content = msg["content"]
+                            context_str += f"[{role}]: {content}\n\n"
+                        context_str += "Current Task:\n"
+
+                full_message = f"{system_note}\n\n{context_str}{user_message}"
             except Exception as e:
-                get_logger().warning(f"Failed to get CWD: {e}")
+                get_logger().warning(f"Failed to get CWD or prepare context: {e}")
                 full_message = user_message
 
             progress.update(task, description="Agent is thinking...")
